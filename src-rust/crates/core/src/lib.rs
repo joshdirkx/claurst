@@ -3634,6 +3634,8 @@ pub mod oauth {
             }
         }
 
+        /// Legacy token file path — kept for backward-compat reads when no
+        /// account registry exists yet. New writes go to per-account dirs.
         pub fn token_file_path() -> std::path::PathBuf {
             dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -3641,8 +3643,10 @@ pub mod oauth {
                 .join("oauth_tokens.json")
         }
 
-        pub async fn save(&self) -> anyhow::Result<()> {
-            let path = Self::token_file_path();
+        /// Save tokens for a specific account profile under
+        /// `~/.claurst/accounts/anthropic/<profile_id>/oauth_tokens.json`.
+        pub async fn save_for_profile(&self, profile_id: &str) -> anyhow::Result<()> {
+            let path = crate::accounts::anthropic_token_path(profile_id);
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
@@ -3650,16 +3654,119 @@ pub mod oauth {
             Ok(())
         }
 
-        pub async fn load() -> Option<Self> {
-            let path = Self::token_file_path();
+        /// Load tokens for a specific account profile, or `None` if missing.
+        pub async fn load_for_profile(profile_id: &str) -> Option<Self> {
+            let path = crate::accounts::anthropic_token_path(profile_id);
             let content = tokio::fs::read_to_string(&path).await.ok()?;
             serde_json::from_str(&content).ok()
         }
 
+        /// Save these tokens, register/refresh a profile in the account
+        /// registry, and mark it active. Returns the profile id used.
+        ///
+        /// If `label` is None, derives the id from email/account_uuid.
+        pub async fn save_and_register(&self, label: Option<&str>) -> anyhow::Result<String> {
+            use crate::accounts::{
+                AccountProfile, AccountRegistry, ensure_unique_profile_id,
+                slugify_profile_id, PROVIDER_ANTHROPIC,
+            };
+
+            let mut registry = AccountRegistry::load();
+
+            // Identity-aware id resolution: if a profile with the same email
+            // or account_uuid already exists, reuse it instead of stacking
+            // duplicates.
+            let existing_id = registry
+                .list(PROVIDER_ANTHROPIC)
+                .into_iter()
+                .find(|p| {
+                    (self.email.is_some() && p.email == self.email)
+                        || (self.account_uuid.is_some()
+                            && p.account_id == self.account_uuid)
+                })
+                .map(|p| p.id);
+
+            let id = if let Some(id) = existing_id {
+                id
+            } else if let Some(label) = label {
+                ensure_unique_profile_id(&registry, PROVIDER_ANTHROPIC, label)
+            } else {
+                let base = self
+                    .email
+                    .as_deref()
+                    .map(|e| e.split('@').next().unwrap_or(e).to_string())
+                    .or_else(|| self.account_uuid.clone())
+                    .unwrap_or_else(|| "account".to_string());
+                ensure_unique_profile_id(&registry, PROVIDER_ANTHROPIC, &base)
+            };
+
+            self.save_for_profile(&id).await?;
+
+            let profile = AccountProfile {
+                id: id.clone(),
+                label: label.map(|l| slugify_profile_id(l)),
+                email: self.email.clone(),
+                account_id: self.account_uuid.clone(),
+                organization_uuid: self.organization_uuid.clone(),
+                subscription_tier: self.subscription_type.clone(),
+                added_at: None,
+                last_selected_at: None,
+            };
+            registry.upsert(PROVIDER_ANTHROPIC, profile, true)?;
+            Ok(id)
+        }
+
+        /// Save (active profile, or new profile if registry empty) — back-compat
+        /// shim for callers that don't think in terms of profiles.
+        pub async fn save(&self) -> anyhow::Result<()> {
+            let registry = crate::accounts::AccountRegistry::load();
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC) {
+                self.save_for_profile(active).await
+            } else {
+                // No registry yet — register as a new profile.
+                self.save_and_register(None).await.map(|_| ())
+            }
+        }
+
+        /// Load tokens for the active anthropic profile. Falls back to the
+        /// legacy `~/.claurst/oauth_tokens.json` (auto-migrating it into a
+        /// "default" profile on first read) if no registry exists.
+        pub async fn load() -> Option<Self> {
+            let mut registry = crate::accounts::AccountRegistry::load();
+
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC) {
+                if let Some(t) = Self::load_for_profile(active).await {
+                    return Some(t);
+                }
+            }
+
+            // Fallback: legacy single-file storage. Migrate on the spot.
+            let legacy = Self::token_file_path();
+            if legacy.exists() {
+                let content = tokio::fs::read_to_string(&legacy).await.ok()?;
+                let tokens: Self = serde_json::from_str(&content).ok()?;
+                // Best-effort migration: register under a derived id.
+                if let Ok(id) = tokens.save_and_register(None).await {
+                    let _ = tokio::fs::remove_file(&legacy).await;
+                    // refresh active pointer
+                    let _ = registry.switch_to(crate::accounts::PROVIDER_ANTHROPIC, &id);
+                }
+                return Some(tokens);
+            }
+            None
+        }
+
+        /// Clear credentials for the active profile (or all credentials if
+        /// `purge_all` is true) and drop the profile from the registry.
         pub async fn clear() -> anyhow::Result<()> {
-            let path = Self::token_file_path();
-            if path.exists() {
-                tokio::fs::remove_file(&path).await?;
+            let mut registry = crate::accounts::AccountRegistry::load();
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC).map(String::from) {
+                registry.remove(crate::accounts::PROVIDER_ANTHROPIC, &active)?;
+            }
+            // Also remove any legacy file.
+            let legacy = Self::token_file_path();
+            if legacy.exists() {
+                tokio::fs::remove_file(&legacy).await?;
             }
             Ok(())
         }
@@ -3747,6 +3854,7 @@ pub mod system_prompt;
 pub mod memdir;
 pub mod oauth_config;
 pub mod codex_oauth;
+pub mod accounts;
 pub mod migrations;
 pub mod output_styles;
 pub mod feature_gates;

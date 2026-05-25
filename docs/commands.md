@@ -16,7 +16,7 @@ This document is the complete reference for every slash command available in Cla
 8. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
 9. [Planning & Review](#planning--review) — `/plan`, `/ultraplan`, `/ultrareview`
 10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `/plugin`, `/chrome`
-11. [Authentication](#authentication) — `/login`, `/logout`, `/refresh`
+11. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
 12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/rocky`, `/normal`, `/mobile`, `/color`, `/stickers`
 13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/version`, `/update`
 14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
@@ -290,7 +290,7 @@ Common keys:
 
 ### /keybindings
 
-Open the interactive keybinding configurator. Displays all bound actions with their current shortcuts. Select an action to rebind it. Changes are written to `~/.claude/keybindings.json`.
+Open the interactive keybinding configurator. Displays all bound actions with their current shortcuts. Select an action to rebind it. Changes are written to `~/.claurst/keybindings.json`.
 
 ```
 /keybindings
@@ -826,22 +826,66 @@ Useful for testing web applications, scraping, or automating browser-based workf
 
 ## Authentication
 
+Claurst supports **multiple named accounts per provider** — Anthropic (Claude.ai or Console) and Codex (OpenAI ChatGPT subscription). Each login creates a profile under `~/.claurst/accounts/<provider>/<id>/` and the registry at `~/.claurst/accounts.json` tracks which one is active.
+
+See [Authentication Guide](./auth.md#multi-account-profiles) for the full story and on-disk layout.
+
 ### /login
 
-Authenticate with Anthropic via OAuth. Opens a browser window for the OAuth flow and stores the resulting credentials in the system keychain or `~/.claude/credentials`.
+Authenticate with Anthropic or Codex via OAuth PKCE. Opens a browser for the flow and saves tokens under the active profile (or creates a new profile if none exists).
 
 ```
-/login
+/login                            — Claude.ai OAuth (Bearer token, default)
+/login --console                  — Console OAuth (creates an API key)
+/login --codex                    — Codex / ChatGPT OAuth
+/login --label work               — name the new profile "work"
+/login --codex --label personal   — Codex login, name the profile "personal"
 ```
+
+If a profile matching the JWT's email or account_id already exists, that profile is refreshed in place — re-logging-in is idempotent. Use `--label` to either name a fresh profile or to disambiguate.
 
 ---
 
 ### /logout
 
-Clear stored authentication tokens. After logout, Claurst will prompt for credentials on next use.
+Remove credentials. By default removes only the **active** profile for the provider; other stored profiles remain switchable.
 
 ```
-/logout
+/logout                — clear active Anthropic profile (drops it from registry)
+/logout --codex        — clear active Codex profile
+/logout --all          — purge every Anthropic profile + clear any API key in settings
+/logout --codex --all  — purge every Codex profile
+```
+
+---
+
+### /accounts
+
+List every stored account across providers. The active profile in each provider is marked with `*`.
+
+```
+/accounts
+```
+
+Sample output:
+
+```
+Anthropic:
+  * personal [pro]    kuber@personal.example
+    work     [max]    kuber@company.example
+Codex:
+    work              kuber@company.example
+```
+
+---
+
+### /switch
+
+Switch the active account for a provider. Anthropic by default; pass `--codex` for Codex. Run `/accounts` first to see available profile ids.
+
+```
+/switch work                     — set active Anthropic profile to "work"
+/switch --codex personal         — set active Codex profile to "personal"
 ```
 
 ---

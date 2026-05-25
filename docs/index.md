@@ -44,6 +44,12 @@ Anthropic Claude (default), OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ol
 ### AMOLED terminal UI
 A ratatui-based TUI with real-time streaming, syntax-highlighted code blocks, diff viewer, permission dialogs, slash command autocomplete, session browser, and a full keybinding system.
 
+### Multi-account credentials
+Store multiple named Anthropic (Claude.ai / Console) and Codex (ChatGPT) accounts in one install and switch between them instantly with `/switch` or `claurst auth switch <id>`. Identity is detected from the OAuth JWT, so re-logging-in the same account is idempotent. See [Authentication](auth#multi-account-profiles).
+
+### @file injection
+Type `@path/to/file` anywhere in a prompt to inject the file's contents inline. Typeahead autocomplete suggests paths as you type, with size/binary safety checks before submit. See [@file Injection](keybindings#file-injection-with-typeahead).
+
 ### Plugin system
 Extend Claurst with TOML-manifest plugins that add custom slash commands, MCP servers, hooks, output styles, and tool overlays.
 
@@ -152,6 +158,10 @@ Inside the interactive TUI, type `/` to see all available commands. Common ones:
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model` | Switch model or provider |
+| `/login` | OAuth login (Anthropic; `--codex` for ChatGPT, `--label <name>` to name) |
+| `/accounts` | List stored Anthropic + Codex accounts |
+| `/switch <id>` | Switch active account (`--codex` for Codex) |
+| `/logout` | Clear credentials for the active account (`--all` to purge) |
 | `/goal <objective>` | Set an autonomous multi-turn goal |
 | `/managed-agents` | Configure manager-executor agents |
 | `/compact` | Compress conversation history |

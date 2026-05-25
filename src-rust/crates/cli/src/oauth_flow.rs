@@ -72,6 +72,16 @@ pub struct LoginResult {
 /// - `false` → Console endpoint (creates an API key)
 /// - `true`  → Claude.ai endpoint (user:inference scope, Bearer auth)
 pub async fn run_oauth_login_flow(login_with_claude_ai: bool) -> anyhow::Result<LoginResult> {
+    run_oauth_login_flow_with_label(login_with_claude_ai, None).await
+}
+
+/// Same as [`run_oauth_login_flow`] but lets the caller supply a human-friendly
+/// label for the new profile (e.g. "work"). When `label` is `None` the profile
+/// id is derived from the JWT email or account_uuid.
+pub async fn run_oauth_login_flow_with_label(
+    login_with_claude_ai: bool,
+    label: Option<&str>,
+) -> anyhow::Result<LoginResult> {
     // 1. PKCE
     let code_verifier = oauth::generate_code_verifier();
     let code_challenge = oauth::generate_code_challenge(&code_verifier);
@@ -158,7 +168,10 @@ pub async fn run_oauth_login_flow(login_with_claude_ai: bool) -> anyhow::Result<
         subscription_type: None,
         api_key: api_key.clone(),
     };
-    tokens.save().await.context("Failed to save OAuth tokens")?;
+    tokens
+        .save_and_register(label)
+        .await
+        .context("Failed to save OAuth tokens")?;
 
     let (credential, use_bearer_auth) = if uses_bearer {
         (token_resp.access_token.clone(), true)

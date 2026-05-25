@@ -333,23 +333,29 @@ pub struct CodexTokens {
     pub expires_at: Option<u64>,
 }
 
-/// Path to the Codex tokens file (~/.claurst/codex_tokens.json)
+/// Legacy single-file path: `~/.claurst/codex_tokens.json`. Kept for
+/// backward-compat reads when no account registry exists.
 fn codex_tokens_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".claurst").join("codex_tokens.json"))
 }
 
-/// Save Codex OAuth tokens to ~/.claurst/codex_tokens.json
-pub fn save_codex_tokens(tokens: &CodexTokens) -> anyhow::Result<()> {
-    let path = codex_tokens_path().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let json = serde_json::to_string(tokens)?;
-    std::fs::write(&path, json)?;
+/// Save Codex OAuth tokens for a named profile under
+/// `~/.claurst/accounts/codex/<profile_id>/codex_tokens.json`.
+pub fn save_codex_tokens_for_profile(
+    tokens: &CodexTokens,
+    profile_id: &str,
+) -> anyhow::Result<()> {
+    let path = crate::accounts::codex_token_path(profile_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(tokens)?)?;
     Ok(())
 }
 
-/// Load Codex OAuth tokens from ~/.claurst/codex_tokens.json
-pub fn get_codex_tokens() -> Option<CodexTokens> {
-    let path = codex_tokens_path()?;
+/// Load Codex OAuth tokens for a named profile.
+pub fn load_codex_tokens_for_profile(profile_id: &str) -> Option<CodexTokens> {
+    let path = crate::accounts::codex_token_path(profile_id);
     if !path.exists() {
         return None;
     }
@@ -357,11 +363,113 @@ pub fn get_codex_tokens() -> Option<CodexTokens> {
     serde_json::from_str(&json).ok()
 }
 
-/// Clear stored Codex tokens
+/// Save Codex OAuth tokens, registering and activating a profile. Returns the
+/// profile id. If a profile with a matching account_id already exists, reuses
+/// it; otherwise derives an id from the JWT identity (or `label`, if given).
+pub fn save_codex_tokens_and_register(
+    tokens: &CodexTokens,
+    label: Option<&str>,
+) -> anyhow::Result<String> {
+    use crate::accounts::{
+        ensure_unique_profile_id, jwt_identity, slugify_profile_id, AccountProfile,
+        AccountRegistry, PROVIDER_CODEX,
+    };
+
+    let identity = jwt_identity(&tokens.access_token);
+    let mut registry = AccountRegistry::load();
+
+    let existing_id = registry
+        .list(PROVIDER_CODEX)
+        .into_iter()
+        .find(|p| {
+            (identity.email.is_some() && p.email == identity.email)
+                || (tokens.account_id.is_some() && p.account_id == tokens.account_id)
+                || (identity.account_id.is_some()
+                    && p.account_id == identity.account_id)
+        })
+        .map(|p| p.id);
+
+    let id = if let Some(id) = existing_id {
+        id
+    } else if let Some(label) = label {
+        ensure_unique_profile_id(&registry, PROVIDER_CODEX, label)
+    } else {
+        let base = identity
+            .email
+            .as_deref()
+            .map(|e| e.split('@').next().unwrap_or(e).to_string())
+            .or_else(|| tokens.account_id.clone())
+            .or_else(|| identity.account_id.clone())
+            .unwrap_or_else(|| "account".to_string());
+        ensure_unique_profile_id(&registry, PROVIDER_CODEX, &base)
+    };
+
+    save_codex_tokens_for_profile(tokens, &id)?;
+
+    let profile = AccountProfile {
+        id: id.clone(),
+        label: label.map(slugify_profile_id),
+        email: identity.email,
+        account_id: tokens
+            .account_id
+            .clone()
+            .or(identity.account_id),
+        organization_uuid: None,
+        subscription_tier: None,
+        added_at: None,
+        last_selected_at: None,
+    };
+    registry.upsert(PROVIDER_CODEX, profile, true)?;
+    Ok(id)
+}
+
+/// Save Codex tokens — back-compat shim. Writes to the active codex profile,
+/// creating one if none exists.
+pub fn save_codex_tokens(tokens: &CodexTokens) -> anyhow::Result<()> {
+    let registry = crate::accounts::AccountRegistry::load();
+    if let Some(active) = registry.active(crate::accounts::PROVIDER_CODEX) {
+        save_codex_tokens_for_profile(tokens, active)
+    } else {
+        save_codex_tokens_and_register(tokens, None).map(|_| ())
+    }
+}
+
+/// Load the active Codex profile's tokens. Falls back to the legacy
+/// single-file storage (auto-migrating on first read).
+pub fn get_codex_tokens() -> Option<CodexTokens> {
+    let registry = crate::accounts::AccountRegistry::load();
+    if let Some(active) = registry.active(crate::accounts::PROVIDER_CODEX) {
+        if let Some(t) = load_codex_tokens_for_profile(active) {
+            return Some(t);
+        }
+    }
+    // Legacy fallback + migration.
+    let legacy = codex_tokens_path()?;
+    if !legacy.exists() {
+        return None;
+    }
+    let json = std::fs::read_to_string(&legacy).ok()?;
+    let tokens: CodexTokens = serde_json::from_str(&json).ok()?;
+    if save_codex_tokens_and_register(&tokens, None).is_ok() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    Some(tokens)
+}
+
+/// Clear tokens for the active Codex profile. Removes the profile from the
+/// registry as well.
 pub fn clear_codex_tokens() -> anyhow::Result<()> {
-    let path = codex_tokens_path().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    let mut registry = crate::accounts::AccountRegistry::load();
+    if let Some(active) = registry
+        .active(crate::accounts::PROVIDER_CODEX)
+        .map(String::from)
+    {
+        registry.remove(crate::accounts::PROVIDER_CODEX, &active)?;
+    }
+    if let Some(legacy) = codex_tokens_path() {
+        if legacy.exists() {
+            std::fs::remove_file(&legacy)?;
+        }
     }
     Ok(())
 }

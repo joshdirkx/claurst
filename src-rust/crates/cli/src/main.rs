@@ -377,6 +377,18 @@ async fn main() -> anyhow::Result<()> {
         return handle_auth_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `claurst codex <login|logout|list|switch|remove>` — manage
+    // OpenAI Codex (ChatGPT) accounts. Mirrors `claurst auth` for symmetry.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("codex") {
+        return handle_codex_account_command(&raw_args[2..]).await;
+    }
+
+    // Fast-path: `claurst accounts` — list all stored accounts across providers.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("accounts") {
+        handle_accounts_command(&raw_args[2..]);
+        return Ok(());
+    }
+
     // Fast-path: `claurst upgrade [--version <v>] [--force]` — self-update.
     if raw_args.get(1).map(|s| s.as_str()) == Some("upgrade") {
         return upgrade::run_upgrade(&raw_args[2..]).await;
@@ -2356,6 +2368,71 @@ async fn run_interactive(
                                     }
                                     terminal = claurst_tui::setup_terminal()?;
                                 }
+                                Some(CommandResult::StartLoginForProvider {
+                                    provider,
+                                    login_with_claude_ai,
+                                    label,
+                                }) => {
+                                    claurst_tui::restore_terminal(&mut terminal).ok();
+                                    if provider == claurst_core::accounts::PROVIDER_CODEX {
+                                        let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                                            claurst_tui::DeviceAuthEvent,
+                                        >(8);
+                                        tokio::spawn(async move {
+                                            while let Some(evt) = rx.recv().await {
+                                                if let claurst_tui::DeviceAuthEvent::GotBrowserUrl {
+                                                    url,
+                                                } = evt
+                                                {
+                                                    eprintln!(
+                                                        "\nOpening browser for Codex \
+                                                         authentication...\nIf the browser \
+                                                         did not open, visit:\n\n  {}\n",
+                                                        url
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        match crate::codex_oauth_flow::run_oauth_flow_with_label(
+                                            tx,
+                                            label.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                app.status_message = Some(
+                                                    "Codex login successful!".to_string(),
+                                                );
+                                                eprintln!("\nCodex login successful!");
+                                                break 'main;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("\nCodex login failed: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        match oauth_flow::run_oauth_login_flow_with_label(
+                                            login_with_claude_ai,
+                                            label.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                app.status_message =
+                                                    Some("Login successful!".to_string());
+                                                eprintln!(
+                                                    "\nLogin successful! Please restart \
+                                                     claurst to use the new credentials."
+                                                );
+                                                break 'main;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("\nLogin failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                    terminal = claurst_tui::setup_terminal()?;
+                                }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
                                 }
@@ -3767,8 +3844,14 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             // --console flag selects the Console OAuth flow (creates an API key)
             // Default (no flag) uses the Claude.ai flow (Bearer token)
             let login_with_claude_ai = !args.iter().any(|a| a == "--console");
+            let label = extract_label_flag(args);
             println!("Starting authentication...");
-            match oauth_flow::run_oauth_login_flow(login_with_claude_ai).await {
+            match oauth_flow::run_oauth_login_flow_with_label(
+                login_with_claude_ai,
+                label.as_deref(),
+            )
+            .await
+            {
                 Ok(result) => {
                     println!("Successfully logged in!");
                     if let Some(email) = &result.tokens.email {
@@ -3778,6 +3861,11 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
                         println!("  Auth method: claude.ai");
                     } else {
                         println!("  Auth method: console (API key)");
+                    }
+                    if let Some(active) = claurst_core::accounts::AccountRegistry::load()
+                        .active(claurst_core::accounts::PROVIDER_ANTHROPIC)
+                    {
+                        println!("  Profile: {}", active);
                     }
                     std::process::exit(0);
                 }
@@ -3797,26 +3885,269 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             auth_status(json_output).await;
         }
 
+        Some("list") | Some("ls") | Some("accounts") => {
+            print_account_list(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic");
+            std::process::exit(0);
+        }
+
+        Some("switch") | Some("use") => {
+            let id = args.get(1).map(|s| s.as_str());
+            switch_account(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic", id);
+        }
+
+        Some("remove") | Some("rm") => {
+            let id = args.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                eprintln!("Usage: claurst auth remove <profile-id>");
+                std::process::exit(1);
+            });
+            remove_account(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic", id);
+        }
+
         Some(unknown) => {
             eprintln!("Unknown auth subcommand: '{}'", unknown);
             eprintln!();
-            eprintln!("Usage: claurst auth <subcommand>");
-            eprintln!("  login [--console]   Authenticate (claude.ai by default; --console for API key)");
-            eprintln!("  logout              Remove stored credentials");
-            eprintln!("  status [--json]     Show authentication status");
+            print_auth_usage();
             std::process::exit(1);
         }
 
         None => {
-            eprintln!("Usage: claurst auth <login|logout|status>");
-            eprintln!("  login [--console]   Authenticate with Anthropic");
-            eprintln!("  logout              Remove stored credentials");
-            eprintln!("  status [--json]     Show authentication status");
+            print_auth_usage();
             std::process::exit(1);
         }
     }
 
     Ok(())
+}
+
+fn print_auth_usage() {
+    eprintln!("Usage: claurst auth <subcommand>");
+    eprintln!("  login [--console] [--label <name>]   Authenticate (claude.ai by default)");
+    eprintln!("  logout                                Remove the active account's credentials");
+    eprintln!("  status [--json]                       Show authentication status");
+    eprintln!("  list                                  List all stored Anthropic accounts");
+    eprintln!("  switch <profile-id>                   Make a stored account active");
+    eprintln!("  remove <profile-id>                   Delete a stored account");
+}
+
+fn extract_label_flag(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--label" || a == "-l" {
+            return it.next().cloned();
+        }
+        if let Some(rest) = a.strip_prefix("--label=") {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+fn print_account_list(provider: &str, display_name: &str) {
+    let registry = claurst_core::accounts::AccountRegistry::load();
+    let profiles = registry.list(provider);
+    let active = registry.active(provider).map(String::from);
+    if profiles.is_empty() {
+        println!("No {} accounts stored.", display_name);
+        println!("Use `claurst {} login` to add one.",
+            if provider == "anthropic" { "auth" } else { provider });
+        return;
+    }
+    println!("{} accounts:", display_name);
+    for p in profiles {
+        let marker = if active.as_deref() == Some(&p.id) { "*" } else { " " };
+        let email = p.email.as_deref().unwrap_or("");
+        let label = p
+            .label
+            .as_deref()
+            .map(|l| format!(" ({})", l))
+            .unwrap_or_default();
+        let tier = p
+            .subscription_tier
+            .as_deref()
+            .map(|t| format!(" [{}]", t))
+            .unwrap_or_default();
+        println!("  {} {}{}{}  {}", marker, p.id, label, tier, email);
+    }
+}
+
+fn switch_account(provider: &str, display_name: &str, id: Option<&str>) -> ! {
+    let mut registry = claurst_core::accounts::AccountRegistry::load();
+    let profiles = registry.list(provider);
+
+    let target = match id {
+        Some(id) => id.to_string(),
+        None => {
+            if profiles.is_empty() {
+                eprintln!("No {} accounts stored.", display_name);
+                std::process::exit(1);
+            }
+            // No id: print the picker and exit with usage.
+            eprintln!("Usage: claurst {} switch <profile-id>",
+                if provider == "anthropic" { "auth" } else { provider });
+            eprintln!();
+            print_account_list(provider, display_name);
+            std::process::exit(1);
+        }
+    };
+
+    match registry.switch_to(provider, &target) {
+        Ok(()) => {
+            println!("Switched {} active account to '{}'.", display_name, target);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            eprintln!();
+            print_account_list(provider, display_name);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `claurst codex` subcommand handler (account-level CLI)
+// ---------------------------------------------------------------------------
+
+async fn handle_codex_account_command(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(|s| s.as_str()) {
+        Some("login") => {
+            let label = extract_label_flag(args);
+            // The Codex flow expects a TUI DeviceAuth dialog. For headless CLI
+            // login we still spin up the OAuth listener but route the URL
+            // through a no-op channel; the user opens the URL in their browser
+            // either way.
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<claurst_tui::DeviceAuthEvent>(8);
+            tokio::spawn(async move {
+                while let Some(evt) = rx.recv().await {
+                    if let claurst_tui::DeviceAuthEvent::GotBrowserUrl { url } = evt {
+                        println!("Opening browser for Codex authentication...");
+                        println!(
+                            "If the browser did not open, visit:\n\n  {}\n",
+                            url
+                        );
+                    }
+                }
+            });
+            match crate::codex_oauth_flow::run_oauth_flow_with_label(tx, label.as_deref()).await
+            {
+                Ok(_) => {
+                    let registry = claurst_core::accounts::AccountRegistry::load();
+                    println!("Successfully logged in to Codex!");
+                    if let Some(p) = registry.active_profile(claurst_core::accounts::PROVIDER_CODEX) {
+                        if let Some(email) = &p.email {
+                            println!("  Account: {}", email);
+                        }
+                        println!("  Profile: {}", p.id);
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Codex login failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("logout") => {
+            match claurst_core::oauth_config::clear_codex_tokens() {
+                Ok(_) => {
+                    println!("Logged out of the active Codex account.");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Logout failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("list") | Some("ls") | Some("accounts") => {
+            print_account_list(claurst_core::accounts::PROVIDER_CODEX, "Codex");
+            std::process::exit(0);
+        }
+        Some("switch") | Some("use") => {
+            let id = args.get(1).map(|s| s.as_str());
+            switch_account(claurst_core::accounts::PROVIDER_CODEX, "Codex", id);
+        }
+        Some("remove") | Some("rm") => {
+            let id = args.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                eprintln!("Usage: claurst codex remove <profile-id>");
+                std::process::exit(1);
+            });
+            remove_account(claurst_core::accounts::PROVIDER_CODEX, "Codex", id);
+        }
+        Some("status") => {
+            let registry = claurst_core::accounts::AccountRegistry::load();
+            match registry.active_profile(claurst_core::accounts::PROVIDER_CODEX) {
+                Some(p) => {
+                    println!("Logged in to Codex.");
+                    println!("  Profile: {}", p.id);
+                    if let Some(email) = &p.email {
+                        println!("  Account: {}", email);
+                    }
+                    std::process::exit(0);
+                }
+                None => {
+                    println!("Not logged in to Codex.");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(unknown) => {
+            eprintln!("Unknown codex subcommand: '{}'", unknown);
+            eprintln!();
+            print_codex_usage();
+            std::process::exit(1);
+        }
+        None => {
+            print_codex_usage();
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_codex_usage() {
+    eprintln!("Usage: claurst codex <subcommand>");
+    eprintln!("  login [--label <name>]   Authenticate with ChatGPT/Codex");
+    eprintln!("  logout                   Remove the active Codex credentials");
+    eprintln!("  status                   Show Codex auth status");
+    eprintln!("  list                     List all stored Codex accounts");
+    eprintln!("  switch <profile-id>      Make a stored Codex account active");
+    eprintln!("  remove <profile-id>      Delete a stored Codex account");
+}
+
+// ---------------------------------------------------------------------------
+// `claurst accounts` — unified read-only list across providers
+// ---------------------------------------------------------------------------
+
+fn handle_accounts_command(args: &[String]) {
+    if args.iter().any(|a| a == "--json") {
+        let registry = claurst_core::accounts::AccountRegistry::load();
+        let json = serde_json::to_string_pretty(&registry).unwrap_or_else(|_| "{}".into());
+        println!("{}", json);
+        return;
+    }
+
+    print_account_list(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic");
+    println!();
+    print_account_list(claurst_core::accounts::PROVIDER_CODEX, "Codex");
+}
+
+fn remove_account(provider: &str, display_name: &str, id: &str) -> ! {
+    let mut registry = claurst_core::accounts::AccountRegistry::load();
+    if registry.get(provider, id).is_none() {
+        eprintln!("No {} account '{}' to remove.", display_name, id);
+        std::process::exit(1);
+    }
+    match registry.remove(provider, id) {
+        Ok(()) => {
+            println!("Removed {} account '{}'.", display_name, id);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Failed to remove account: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn provider_status_lookup_keys(provider_id: &str) -> Vec<&str> {
