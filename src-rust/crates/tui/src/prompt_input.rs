@@ -16,6 +16,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
 const PROMPT_POINTER: &str = "\u{276f}";
@@ -2697,9 +2698,9 @@ impl PromptInputState {
                 while b > 0 && !line.is_char_boundary(b) {
                     b -= 1;
                 }
-                let intra_chars = line[..b].chars().count();
-                let chunk_idx = if intra_chars == 0 { 0 } else { intra_chars / width };
-                let chunk_col = intra_chars % width;
+                let display_col = UnicodeWidthStr::width(&line[..b]);
+                let chunk_idx = if display_col == 0 { 0 } else { display_col / width };
+                let chunk_col = display_col % width;
                 return (row + chunk_idx, chunk_col);
             }
             let chunks = wrap_line(line, width).len().max(1);
@@ -2839,24 +2840,33 @@ pub fn input_height(state: &PromptInputState, text_width: u16) -> u16 {
     base + if state.pending_images.is_empty() { 0 } else { 1 }
 }
 
-/// Wrap a logical line into visual chunks of `width` chars (char-based, not
-/// byte-based, to preserve UTF-8 characters). Empty input yields a single
-/// empty chunk so the caller can still place a cursor.
+/// Wrap a logical line into visual chunks of `width` terminal cells. Empty
+/// input yields a single empty chunk so the caller can still place a cursor.
 pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![line.to_string()];
     }
-    let chars: Vec<char> = line.chars().collect();
-    if chars.is_empty() {
+    if line.is_empty() {
         return vec![String::new()];
     }
-    let mut out = Vec::with_capacity(chars.len() / width + 1);
-    let mut i = 0;
-    while i < chars.len() {
-        let end = (i + width).min(chars.len());
-        out.push(chars[i..end].iter().collect());
-        i = end;
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in line.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            out.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
     }
+    if !current.is_empty() {
+        out.push(current);
+    }
+
     out
 }
 
@@ -2908,7 +2918,7 @@ pub fn render_prompt_input(
         _ => accent_override,                   // use mode-aware accent color
     };
     let prompt_prefix = format!("{PROMPT_POINTER} ");
-    let prefix_width = prompt_prefix.chars().count() as u16;
+    let prefix_width = UnicodeWidthStr::width(prompt_prefix.as_str()) as u16;
     // Reserve a 2-cell right margin so wrapped text doesn't kiss the right edge
     // of the box (issue #149: padding too tight).
     let right_pad: u16 = 2;
@@ -2973,21 +2983,22 @@ pub fn render_prompt_input(
     };
 
     // Wrap each logical line into visual rows that fit `available_width`,
-    // and remember the (logical_idx, intra_line_char_offset) for each row
+    // and remember the (logical_idx, intra_line_display_col) for each row
     // so we can later compute where the cursor lives.
     let mut visual_rows: Vec<(usize, usize, String)> = Vec::new();
     for (li, line_text) in logical_lines.iter().enumerate() {
         let chunks = wrap_line(line_text, available_width.max(1));
         let mut col_offset = 0usize;
         for chunk in chunks {
-            let chunk_len = chunk.chars().count();
+            let chunk_len = UnicodeWidthStr::width(chunk.as_str());
             visual_rows.push((li, col_offset, chunk));
             col_offset += chunk_len;
         }
     }
 
     // Compute cursor's visual (row, col) within `visual_rows`.
-    // We map state.cursor (a byte offset into state.text) to (logical_line, char_offset).
+    // We map state.cursor (a byte offset into state.text) to
+    // (logical_line, display column).
     let cursor_pos: Option<(usize, usize)> = if focused && !state.text.is_empty() {
         let mut byte_idx = 0usize;
         let mut found: Option<(usize, usize)> = None;
@@ -2997,8 +3008,8 @@ pub fn render_prompt_input(
             let line_end_byte = byte_idx + line_bytes;
             if state.cursor <= line_end_byte {
                 let intra_byte = state.cursor - byte_idx;
-                let char_offset = line_text[..intra_byte.min(line_bytes)].chars().count();
-                found = Some((li, char_offset));
+                let display_col = UnicodeWidthStr::width(&line_text[..intra_byte.min(line_bytes)]);
+                found = Some((li, display_col));
                 break 'outer;
             }
             byte_idx = line_end_byte + 1; // newline
@@ -3006,7 +3017,10 @@ pub fn render_prompt_input(
         // Fallback: cursor at end of text.
         found.or_else(|| {
             let li = logical_lines.len().saturating_sub(1);
-            let col = logical_lines.get(li).map(|s| s.chars().count()).unwrap_or(0);
+            let col = logical_lines
+                .get(li)
+                .map(|s| UnicodeWidthStr::width(s.as_str()))
+                .unwrap_or(0);
             Some((li, col))
         })
     } else if focused && state.text.is_empty() {
@@ -3022,7 +3036,7 @@ pub fn render_prompt_input(
             if *row_li != li {
                 continue;
             }
-            let chunk_len = chunk.chars().count();
+            let chunk_len = UnicodeWidthStr::width(chunk.as_str());
             let row_col_end = row_col_start + chunk_len;
             if col >= *row_col_start && col <= row_col_end {
                 last_match = Some((vi, col - row_col_start));
@@ -3366,6 +3380,36 @@ mod tests {
         assert_eq!(s.cursor, 2);
         s.move_left();
         assert_eq!(s.cursor, 1);
+    }
+
+    #[test]
+    fn cursor_visual_pos_counts_wide_characters() {
+        let mut s = PromptInputState::new();
+        s.text = "你a".to_string();
+        s.cursor = "你".len();
+
+        assert_eq!(s.cursor_visual_pos(10), (0, 2));
+    }
+
+    #[test]
+    fn render_cursor_after_wide_character() {
+        let mut s = PromptInputState::new();
+        s.text = "你a".to_string();
+        s.cursor = "你".len();
+
+        let area = Rect { x: 0, y: 0, width: 12, height: 4 };
+        let mut buf = Buffer::empty(area);
+        render_prompt_input(
+            &s,
+            area,
+            &mut buf,
+            true,
+            InputMode::Default,
+            Color::Blue,
+            false,
+        );
+
+        assert_eq!(buf[(4, 1)].symbol(), "\u{2588}");
     }
 
     #[test]
