@@ -1337,6 +1337,8 @@ pub mod config {
                         .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
                 })
                 .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
+                // Support {env:VAR_NAME} patterns in the resolved value
+                .map(|key| substitute_env_vars(&key))
         }
 
         pub fn resolve_anthropic_api_key(&self) -> Option<String> {
@@ -1354,6 +1356,8 @@ pub mod config {
                         .iter()
                         .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
                 })
+                // Support {env:VAR_NAME} patterns in the resolved value
+                .map(|key| substitute_env_vars(&key))
         }
 
         /// Resolve the API key for the active provider.
@@ -1450,6 +1454,8 @@ pub mod config {
                         .filter(|base| !base.is_empty())
                 })
                 .or_else(|| default_api_base_for_provider(provider_id).map(str::to_owned))
+                // Support {env:VAR_NAME} patterns in the resolved base URL
+                .map(|base| substitute_env_vars(&base))
         }
 
         pub fn resolve_anthropic_api_base(&self) -> String {
