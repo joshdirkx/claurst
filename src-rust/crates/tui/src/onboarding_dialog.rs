@@ -386,8 +386,11 @@ mod tests {
     #[test]
     fn onboarding_defaults_hidden() {
         let state = OnboardingDialogState::new();
+        // The dialog starts hidden; the app calls show()/show_provider_setup()
+        // to pick the entry page, so the default page is just the enum default
+        // (ProviderSetup — the no-credentials path).
         assert!(!state.visible);
-        assert_eq!(state.page, OnboardingPage::Welcome);
+        assert_eq!(state.page, OnboardingPage::ProviderSetup);
     }
 
     #[test]

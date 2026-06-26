@@ -715,16 +715,22 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bindings_contains_ctrl_c() {
+    fn test_default_bindings_omit_ctrl_c_and_ctrl_d() {
+        // Ctrl+C and Ctrl+D are intentionally NOT in the resolver table: since
+        // commit 270947d they are handled directly in handle_key_event for the
+        // alternating two-press exit/interrupt confirmation. The resolver must
+        // not shadow that special handling, so the table must omit them.
         let bindings = default_bindings();
-        let ctrl_c = bindings.iter().find(|b| {
-            b.chord.len() == 1
-                && b.chord[0].ctrl
-                && b.chord[0].key == "c"
-                && b.context == KeyContext::Global
-        });
-        assert!(ctrl_c.is_some());
-        assert_eq!(ctrl_c.unwrap().action.as_deref(), Some("interrupt"));
+        let has = |key: &str| {
+            bindings.iter().any(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].ctrl
+                    && b.chord[0].key == key
+                    && b.context == KeyContext::Global
+            })
+        };
+        assert!(!has("c"), "ctrl+c must be handled directly, not via the resolver");
+        assert!(!has("d"), "ctrl+d must be handled directly, not via the resolver");
     }
 
     #[test]
@@ -756,9 +762,11 @@ mod tests {
     fn test_resolver_simple_action() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
-        let ks = parse_keystroke("ctrl+c").unwrap();
+        // ctrl+l is a single-chord Global binding ("redraw"); ctrl+c is no
+        // longer resolver-routed (see test_default_bindings_omit_ctrl_c_and_ctrl_d).
+        let ks = parse_keystroke("ctrl+l").unwrap();
         let result = resolver.process(ks, &KeyContext::Global);
-        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "interrupt"));
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "redraw"));
     }
 
     #[test]

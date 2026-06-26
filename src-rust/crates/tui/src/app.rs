@@ -6656,12 +6656,18 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_a_shortcut_opens_model_picker() {
+    fn test_ctrl_shift_a_shortcut_opens_model_picker() {
         let mut app = make_app();
         app.has_credentials = true;
         app.config.provider = Some("anthropic".to_string());
 
-        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        // The model-picker shortcut moved from Ctrl+A to Ctrl+Shift+A in
+        // commit 8da4a29 to resolve the Ctrl+A conflict (goLineStart in the
+        // prompt). The default bindings map ctrl+shift+a -> openModelPicker.
+        app.handle_key_event(press_key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
 
         assert!(app.model_picker.visible);
     }
