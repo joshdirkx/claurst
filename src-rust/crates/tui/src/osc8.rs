@@ -51,9 +51,16 @@ pub struct UrlHit {
 }
 
 fn enabled() -> bool {
-    match std::env::var("CLAURST_NO_HYPERLINKS").as_deref() {
-        Ok(v) => !matches!(v.trim(), "1" | "true" | "yes" | "on"),
-        Err(_) => true,
+    enabled_for(std::env::var("CLAURST_NO_HYPERLINKS").ok().as_deref())
+}
+
+/// Pure decision split out from [`enabled`] so it can be unit-tested without
+/// mutating the process-global env var (which races with the URL-scan tests
+/// running in parallel and made them flaky).
+fn enabled_for(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(v.trim(), "1" | "true" | "yes" | "on"),
+        None => true,
     }
 }
 
@@ -306,22 +313,13 @@ mod tests {
 
     #[test]
     fn enabled_respects_env_var() {
-        // Save & restore the env var around the asserts so other tests don't
-        // observe stray state. (No #[serial] crate available here.)
-        let prev = std::env::var("CLAURST_NO_HYPERLINKS").ok();
-
-        std::env::remove_var("CLAURST_NO_HYPERLINKS");
-        assert!(enabled());
-
-        std::env::set_var("CLAURST_NO_HYPERLINKS", "1");
-        assert!(!enabled());
-
-        std::env::set_var("CLAURST_NO_HYPERLINKS", "0");
-        assert!(enabled());
-
-        match prev {
-            Some(v) => std::env::set_var("CLAURST_NO_HYPERLINKS", v),
-            None => std::env::remove_var("CLAURST_NO_HYPERLINKS"),
-        }
+        // Test the pure decision directly — no env mutation, so this can't
+        // race with the URL-scan tests running in parallel.
+        assert!(enabled_for(None));
+        assert!(!enabled_for(Some("1")));
+        assert!(!enabled_for(Some("true")));
+        assert!(!enabled_for(Some(" on ")));
+        assert!(enabled_for(Some("0")));
+        assert!(enabled_for(Some("")));
     }
 }

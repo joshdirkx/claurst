@@ -38,12 +38,24 @@ impl McpToken {
     }
 }
 
-/// Path to the token store for a given MCP server.
-fn token_path(server_name: &str) -> PathBuf {
+/// Directory holding the MCP OAuth token store.
+///
+/// Defaults to `~/.claurst/mcp-tokens`, but can be redirected with the
+/// `CLAURST_MCP_TOKENS_DIR` environment variable. The override lets tests run
+/// hermetically (and lets packagers/sandboxes relocate the store) without
+/// writing to the real HOME, which is unwritable in sandboxed builds.
+fn token_store_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CLAURST_MCP_TOKENS_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_default()
         .join(".claurst/mcp-tokens")
-        .join(format!("{}.json", server_name))
+}
+
+/// Path to the token store for a given MCP server.
+fn token_path(server_name: &str) -> PathBuf {
+    token_store_dir().join(format!("{}.json", server_name))
 }
 
 /// Persist an MCP OAuth token to disk.

@@ -4,7 +4,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -13,17 +13,27 @@ use tracing::debug;
 
 /// Returns the path to the persisted todo list for `session_id`.
 pub fn todos_path(session_id: &str) -> PathBuf {
+    todos_dir().join(format!("{}.json", session_id))
+}
+
+/// Directory holding persisted todo lists (`~/.claurst/todos`).
+fn todos_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
         .join(".claurst")
         .join("todos")
-        .join(format!("{}.json", session_id))
 }
 
 /// Load the persisted todo list for `session_id`. Returns an empty vec if the
 /// file does not exist or cannot be parsed.
 pub fn load_todos(session_id: &str) -> Vec<Value> {
-    let path = todos_path(session_id);
+    load_todos_in(&todos_dir(), session_id)
+}
+
+/// Like [`load_todos`] but reads from an explicit todos directory. Lets tests
+/// run hermetically without depending on a writable HOME.
+pub fn load_todos_in(dir: &Path, session_id: &str) -> Vec<Value> {
+    let path = dir.join(format!("{}.json", session_id));
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
@@ -32,7 +42,13 @@ pub fn load_todos(session_id: &str) -> Vec<Value> {
 
 /// Persist `todos` to `~/.claurst/todos/<session_id>.json`.
 pub fn save_todos(session_id: &str, todos: &[Value]) {
-    let path = todos_path(session_id);
+    save_todos_in(&todos_dir(), session_id, todos);
+}
+
+/// Like [`save_todos`] but writes into an explicit todos directory. Lets tests
+/// run hermetically without depending on a writable HOME.
+pub fn save_todos_in(dir: &Path, session_id: &str, todos: &[Value]) {
+    let path = dir.join(format!("{}.json", session_id));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -378,13 +394,13 @@ mod tests {
             json!({"id": "1", "content": "Task one", "status": "pending"}),
             json!({"id": "2", "content": "Task two", "status": "completed"}),
         ];
-        save_todos(&session_id, &todos);
-        let loaded = load_todos(&session_id);
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_todos_in(dir.path(), &session_id, &todos);
+        let loaded = load_todos_in(dir.path(), &session_id);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0]["id"].as_str(), Some("1"));
         assert_eq!(loaded[1]["status"].as_str(), Some("completed"));
-        // Clean up.
-        let _ = std::fs::remove_file(todos_path(&session_id));
+        // tempdir cleans up automatically.
     }
 
     // --- Status parsing ------------------------------------------------------

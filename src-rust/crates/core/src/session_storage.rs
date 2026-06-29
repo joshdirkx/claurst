@@ -230,8 +230,15 @@ pub fn projects_dir() -> PathBuf {
 /// to produce a stable, platform-safe directory name that is fully reversible
 /// (unlike the TS `sanitizePath` which just replaces chars with hyphens).
 pub fn transcript_dir(project_root: &Path) -> PathBuf {
+    transcript_dir_in(&crate::config::Settings::config_dir(), project_root)
+}
+
+/// Like [`transcript_dir`] but rooted at an explicit config directory instead
+/// of the detected `~/.claurst`. Lets tests stage transcripts in a tempdir
+/// without writing under HOME (unwritable in sandboxed builds).
+pub fn transcript_dir_in(config_dir: &Path, project_root: &Path) -> PathBuf {
     let encoded = URL_SAFE_NO_PAD.encode(project_root.to_string_lossy().as_bytes());
-    projects_dir().join(encoded)
+    config_dir.join("projects").join(encoded)
 }
 
 /// Returns the full path to a session's JSONL transcript file.
@@ -365,7 +372,16 @@ pub async fn load_transcript(path: &Path) -> crate::Result<Vec<TranscriptEntry>>
 /// For each file, a cheap tail-read extracts the `last-prompt` and
 /// `custom-title` metadata without loading the full transcript.
 pub async fn list_sessions(project_root: &Path) -> crate::Result<Vec<SessionSummary>> {
-    let dir = transcript_dir(project_root);
+    list_sessions_in(&crate::config::Settings::config_dir(), project_root).await
+}
+
+/// Like [`list_sessions`] but rooted at an explicit config directory. See
+/// [`transcript_dir_in`].
+pub async fn list_sessions_in(
+    config_dir: &Path,
+    project_root: &Path,
+) -> crate::Result<Vec<SessionSummary>> {
+    let dir = transcript_dir_in(config_dir, project_root);
 
     let mut dir_entries = match tokio::fs::read_dir(&dir).await {
         Ok(d) => d,
@@ -691,7 +707,7 @@ mod tests {
         let project_root = tmp.path().join("myproject");
         tokio::fs::create_dir_all(&project_root).await.unwrap();
 
-        let tdir = transcript_dir(&project_root);
+        let tdir = transcript_dir_in(tmp.path(), &project_root);
         tokio::fs::create_dir_all(&tdir).await.unwrap();
 
         for id in ["aaaa", "bbbb"] {
@@ -704,7 +720,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        let sessions = list_sessions(&project_root).await.unwrap();
+        let sessions = list_sessions_in(tmp.path(), &project_root).await.unwrap();
         assert_eq!(sessions.len(), 2);
         // Newest first.
         assert_eq!(sessions[0].session_id, "bbbb");

@@ -53,8 +53,20 @@ async fn git(dir: &Path, args: &[&str]) {
         .ok();
 }
 
+/// A process-wide tempdir that backs every shadow snapshot store in this test
+/// binary. Routing snapshots here keeps the tests hermetic: sandboxed builds
+/// (e.g. Nix) run with no HOME and disallow writes outside the build tree, so
+/// the real `dirs::data_dir()` location is unwritable. Each test uses a
+/// distinct repo tempdir, so the per-project/worktree hashes never collide.
+fn shadow_data_root() -> &'static Path {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| tempfile::tempdir().expect("shadow data tempdir"))
+        .path()
+}
+
 fn snap_or_skip(dir: &Path) -> ShadowSnapshot {
-    match ShadowSnapshot::for_session(dir) {
+    match ShadowSnapshot::for_session_in(dir, shadow_data_root()) {
         Some(s) => s,
         None => {
             eprintln!("git not available or not a repo; skipping test");
