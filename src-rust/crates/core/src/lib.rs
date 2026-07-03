@@ -893,6 +893,9 @@ pub mod config {
         pub api_key: Option<String>,
         /// Override the default base URL for this provider
         pub api_base: Option<String>,
+        /// AWS region for Bedrock (and any other region-scoped providers)
+        #[serde(default)]
+        pub region: Option<String>,
         /// Whether this provider is enabled (default: true)
         #[serde(default = "default_true")]
         pub enabled: bool,
@@ -923,6 +926,7 @@ pub mod config {
             Self {
                 api_key: None,
                 api_base: None,
+                region: None,
                 enabled: true,
                 models_whitelist: Vec::new(),
                 models_blacklist: Vec::new(),

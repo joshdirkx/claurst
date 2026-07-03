@@ -88,6 +88,42 @@ impl BedrockProvider {
         })
     }
 
+    /// Build a provider from explicit credentials and region.
+    /// Used by `provider_from_config` when `provider_configs["amazon-bedrock"]`
+    /// specifies a region and the credentials come from env vars.
+    pub fn from_env_with_region(region: String) -> Option<Self> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .expect("failed to build reqwest client");
+
+        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+            return Some(Self {
+                id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+                region,
+                http_client,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                bearer_token: Some(token),
+            });
+        }
+
+        let key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
+        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
+        let session = std::env::var("AWS_SESSION_TOKEN").ok();
+
+        Some(Self {
+            id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+            region,
+            http_client,
+            access_key_id: Some(key),
+            secret_access_key: Some(secret),
+            session_token: session,
+            bearer_token: None,
+        })
+    }
+
     /// Add a regional cross-inference prefix for models that support it.
     fn model_id_with_prefix(&self, model: &str) -> String {
         // Skip if already has a dot-separated prefix (e.g. "us.anthropic.claude-...")
@@ -268,7 +304,8 @@ impl BedrockProvider {
             "inferenceConfig": {
                 "maxTokens": request.max_tokens,
                 "temperature": request.temperature.unwrap_or(0.7),
-                "topP": request.top_p.unwrap_or(0.9),
+                // topP omitted: Bedrock Claude rejects requests that specify
+                // both temperature and topP simultaneously.
                 "stopSequences": request.stop_sequences,
             }
         });
@@ -687,72 +724,72 @@ impl LlmProvider for BedrockProvider {
 
                 buf.extend_from_slice(&chunk);
 
-                // Extract all complete JSON objects from the buffer.
-                // The AWS event-stream format prefixes each event with a
-                // 12-byte prelude (total-len + headers-len + crc32) followed
-                // by variable-length headers and then a JSON payload.  Rather
-                // than fully parsing the binary framing we scan for JSON
-                // object boundaries which is sufficient for the text events.
+                // AWS EventStream binary framing:
+                //   [4 total_len][4 headers_len][4 prelude_crc][headers...][payload...][4 msg_crc]
+                // total_len includes all 16 framing bytes.
+                // payload starts at byte (12 + headers_len) and ends at (total_len - 4).
                 loop {
-                    // Find the first '{' in the buffer.
-                    let start = match buf.iter().position(|&b| b == b'{') {
-                        Some(p) => p,
-                        None => {
-                            buf.clear();
-                            break;
-                        }
-                    };
+                    // Need at least 12 bytes for the prelude.
+                    if buf.len() < 12 {
+                        break;
+                    }
 
-                    // Drain everything before the opening brace.
-                    buf.drain(..start);
+                    let total_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    let headers_len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
 
-                    // Try to parse a complete JSON object.
-                    match serde_json::from_slice::<Value>(&buf) {
-                        Ok(val) => {
-                            let consumed = serde_json::to_vec(&val)
-                                .map(|v| v.len())
-                                .unwrap_or(buf.len());
-                            buf.drain(..consumed);
-                            // Process the event.
-                            for ev in parse_bedrock_event(&val, &provider_id, &mut message_started) {
+                    // Sanity check: reject obviously corrupt frames.
+                    if total_len < 16 || total_len > 1_048_576 || headers_len > total_len {
+                        buf.drain(..1);
+                        continue;
+                    }
+
+                    // Wait until we have the full message.
+                    if buf.len() < total_len {
+                        break;
+                    }
+
+                    // Extract the payload (between headers and trailing CRC).
+                    let payload_start = 12 + headers_len;
+                    let payload_end = total_len - 4;
+
+                    if payload_start <= payload_end {
+                        // Parse the ":event-type" header from the binary headers block.
+                        // Header wire format: [u8 name_len][name bytes][u8 type][...value...]
+                        // type 7 = string: [u16 value_len][value bytes]
+                        let event_type = extract_event_type(&buf[12..12 + headers_len]);
+
+                        let payload = &buf[payload_start..payload_end];
+                        if let Ok(val) = serde_json::from_slice::<Value>(payload) {
+                            for ev in parse_bedrock_event(&val, event_type.as_deref(), &provider_id, &mut message_started) {
                                 yield ev;
                             }
                         }
-                        Err(e) if e.is_eof() => {
-                            // Incomplete — wait for more data.
-                            break;
-                        }
-                        Err(_) => {
-                            // Invalid JSON at this position — skip one byte and retry.
-                            if !buf.is_empty() {
-                                buf.drain(..1);
-                            } else {
-                                break;
-                            }
-                        }
                     }
+
+                    // Consume the full message from the buffer.
+                    buf.drain(..total_len);
                 }
             }
 
-            // Drain any remaining complete JSON in the buffer.
+            // Drain any remaining complete EventStream messages.
             loop {
-                let start = match buf.iter().position(|&b| b == b'{') {
-                    Some(p) => p,
-                    None => break,
-                };
-                buf.drain(..start);
-                match serde_json::from_slice::<Value>(&buf) {
-                    Ok(val) => {
-                        let consumed = serde_json::to_vec(&val)
-                            .map(|v| v.len())
-                            .unwrap_or(buf.len());
-                        buf.drain(..consumed);
-                        for ev in parse_bedrock_event(&val, &provider_id, &mut message_started) {
+                if buf.len() < 12 { break; }
+                let total_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                let headers_len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+                if total_len < 16 || total_len > 1_048_576 || headers_len > total_len { break; }
+                if buf.len() < total_len { break; }
+                let payload_start = 12 + headers_len;
+                let payload_end = total_len - 4;
+                if payload_start <= payload_end {
+                    let event_type = extract_event_type(&buf[12..12 + headers_len]);
+                    let payload = &buf[payload_start..payload_end];
+                    if let Ok(val) = serde_json::from_slice::<Value>(payload) {
+                        for ev in parse_bedrock_event(&val, event_type.as_deref(), &provider_id, &mut message_started) {
                             yield ev;
                         }
                     }
-                    Err(_) => break,
                 }
+                buf.drain(..total_len);
             }
 
             if message_started {
@@ -844,18 +881,66 @@ impl LlmProvider for BedrockProvider {
 // Bedrock event parsing helper (free function so it can be used in stream!)
 // ---------------------------------------------------------------------------
 
+/// Extract the ":event-type" value from an AWS EventStream binary headers block.
+/// Header wire format: [u8 name_len][name bytes][u8 type][...value...]
+/// type 7 = string: [u16 value_len][value bytes]
+fn extract_event_type(headers: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    while pos < headers.len() {
+        if pos >= headers.len() { break; }
+        let name_len = headers[pos] as usize;
+        pos += 1;
+        if pos + name_len > headers.len() { break; }
+        let name = &headers[pos..pos + name_len];
+        pos += name_len;
+        if pos >= headers.len() { break; }
+        let htype = headers[pos];
+        pos += 1;
+        match htype {
+            7 => {
+                // String: [u16 value_len][value bytes]
+                if pos + 2 > headers.len() { break; }
+                let vlen = u16::from_be_bytes([headers[pos], headers[pos + 1]]) as usize;
+                pos += 2;
+                if pos + vlen > headers.len() { break; }
+                let value = &headers[pos..pos + vlen];
+                pos += vlen;
+                if name == b":event-type" {
+                    return String::from_utf8(value.to_vec()).ok();
+                }
+            }
+            0 => {} // bool true
+            1 => {} // bool false
+            2 | 3 | 4 | 5 => { pos += 1; } // byte/short/int/long (simplified)
+            6 => { pos += 8; } // timestamp
+            8 => { // bytes
+                if pos + 2 > headers.len() { break; }
+                let vlen = u16::from_be_bytes([headers[pos], headers[pos + 1]]) as usize;
+                pos += 2 + vlen;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
 fn parse_bedrock_event(
     val: &Value,
+    event_type: Option<&str>,
     provider_id: &ProviderId,
     message_started: &mut bool,
 ) -> Vec<Result<StreamEvent, ProviderError>> {
     let mut events = Vec::new();
 
     // Bedrock Converse streaming events come in several shapes.
-    // We check for the most common ones:
+    // When event_type is provided (from EventStream headers), use it directly.
+    // The payload fields are at the top level (not wrapped in the event-type key).
 
-    // messageStart
-    if let Some(msg_start) = val.get("messageStart") {
+    // messageStart — flat payload: {"role":"assistant","p":"..."}
+    // or wrapped: {"messageStart":{"role":"assistant"}}
+    let is_message_start = event_type == Some("messageStart") || val.get("messageStart").is_some();
+    if is_message_start {
+        let msg_start = val.get("messageStart").unwrap_or(val);
         let role = msg_start
             .get("role")
             .and_then(|v| v.as_str())
@@ -872,8 +957,11 @@ fn parse_bedrock_event(
         return events;
     }
 
-    // contentBlockStart
-    if let Some(cb_start) = val.get("contentBlockStart") {
+    // contentBlockStart — flat: {"contentBlockIndex":0,"start":{...},"p":"..."}
+    // or wrapped: {"contentBlockStart":{"contentBlockIndex":0,"start":{...}}}
+    let is_cb_start = event_type == Some("contentBlockStart") || val.get("contentBlockStart").is_some();
+    if is_cb_start {
+        let cb_start = val.get("contentBlockStart").unwrap_or(val);
         let index = cb_start
             .get("contentBlockIndex")
             .and_then(|v| v.as_u64())
@@ -915,8 +1003,11 @@ fn parse_bedrock_event(
         return events;
     }
 
-    // contentBlockDelta
-    if let Some(cb_delta) = val.get("contentBlockDelta") {
+    // contentBlockDelta — flat: {"contentBlockIndex":0,"delta":{"text":"..."},"p":"..."}
+    // or wrapped: {"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"..."}}}
+    let is_cb_delta = event_type == Some("contentBlockDelta") || val.get("contentBlockDelta").is_some();
+    if is_cb_delta {
+        let cb_delta = val.get("contentBlockDelta").unwrap_or(val);
         let index = cb_delta
             .get("contentBlockIndex")
             .and_then(|v| v.as_u64())
@@ -957,8 +1048,10 @@ fn parse_bedrock_event(
         return events;
     }
 
-    // contentBlockStop
-    if let Some(cb_stop) = val.get("contentBlockStop") {
+    // contentBlockStop — flat: {"contentBlockIndex":0,"p":"..."}
+    let is_cb_stop = event_type == Some("contentBlockStop") || val.get("contentBlockStop").is_some();
+    if is_cb_stop {
+        let cb_stop = val.get("contentBlockStop").unwrap_or(val);
         let index = cb_stop
             .get("contentBlockIndex")
             .and_then(|v| v.as_u64())
@@ -967,8 +1060,10 @@ fn parse_bedrock_event(
         return events;
     }
 
-    // messageStop
-    if let Some(msg_stop) = val.get("messageStop") {
+    // messageStop — flat: {"stopReason":"end_turn","p":"..."} or wrapped
+    let is_msg_stop = event_type == Some("messageStop") || val.get("messageStop").is_some();
+    if is_msg_stop {
+        let msg_stop = val.get("messageStop").unwrap_or(val);
         let stop_reason_str = msg_stop
             .get("stopReason")
             .and_then(|v| v.as_str())

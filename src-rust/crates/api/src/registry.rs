@@ -241,6 +241,17 @@ pub fn provider_from_config(
             Some(Arc::new(provider))
         }
         "cohere" => api_key.map(|key| Arc::new(CohereProvider::new(key)) as Arc<dyn LlmProvider>),
+        "amazon-bedrock" => {
+            // Region priority: provider_configs["amazon-bedrock"].region field,
+            // then AWS_REGION env var, then AWS_DEFAULT_REGION, then us-east-1.
+            let region = provider_cfg
+                .and_then(|cfg| cfg.region.as_deref())
+                .map(str::to_owned)
+                .or_else(|| std::env::var("AWS_REGION").ok())
+                .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            BedrockProvider::from_env_with_region(region).map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
+        }
         "github-copilot" => {
             api_key.map(|key| Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>)
         }
