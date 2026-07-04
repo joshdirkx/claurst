@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 // Modules
 // ---------------------------------------------------------------------------
 pub mod bedrock_pricing;
+pub mod bedrock_knowledge_base;
 pub mod bun_tls;
 pub mod codex_adapter;
 
@@ -91,6 +92,10 @@ pub use error_handling::{is_context_overflow, parse_error_response, RetryConfig}
 pub use providers::AzureProvider;
 pub use providers::BedrockProvider;
 pub use providers::CopilotProvider;
+pub use bedrock_knowledge_base::{
+    BedrockKnowledgeBaseClient, BedrockKnowledgeBaseRetrievalResult,
+    BedrockKnowledgeBaseRetrieveRequest, BedrockKnowledgeBaseRetrieveResponse,
+};
 
 // Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
 pub use providers::{

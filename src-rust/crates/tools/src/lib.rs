@@ -17,6 +17,7 @@ use std::sync::Arc;
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
 pub mod bash;
+pub mod bedrock_knowledge_base;
 pub mod pty_bash;
 pub mod brief;
 pub mod config_tool;
@@ -58,6 +59,7 @@ pub mod goal_complete;
 pub use formatter::try_format_file;
 pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
+pub use bedrock_knowledge_base::BedrockKnowledgeBaseRetrieveTool;
 pub use pty_bash::PtyBashTool;
 pub use brief::BriefTool;
 pub use config_tool::ConfigTool;
@@ -534,6 +536,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(GrepTool),
         Box::new(WebFetchTool),
         Box::new(WebSearchTool),
+        Box::new(BedrockKnowledgeBaseRetrieveTool),
         Box::new(NotebookEditTool),
         Box::new(TaskCreateTool),
         Box::new(TaskGetTool),

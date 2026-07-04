@@ -103,6 +103,14 @@ pub(crate) fn merge_bedrock_options(body: &mut Value, provider_options: &Value) 
                 // the Bedrock provider turns it into concrete `cachePoint`
                 // content blocks at the stable tool/system/message boundaries.
             }
+            "knowledgeBases" | "knowledge_bases" | "knowledgeBase" | "knowledge_base"
+            | "defaultKnowledgeBase" | "default_knowledge_base" => {
+                // Knowledge Base settings configure Claurst's retrieval tool,
+                // not Converse itself. Keep them in provider config so the
+                // tool can resolve aliases/defaults, but never forward them to
+                // Bedrock model invocation where they would be rejected as
+                // unknown root fields.
+            }
             "inferenceConfig" | "toolConfig" | "reasoningConfig" | "additionalModelRequestFields" => {
                 match (body_obj.get_mut(key), value) {
                     (Some(Value::Object(target_obj)), Value::Object(source_obj)) => {
@@ -207,6 +215,28 @@ mod tests {
         );
 
         assert!(body.get("promptCaching").is_none());
+        assert_eq!(body["additionalModelRequestFields"]["top_k"], json!(10));
+    }
+
+    #[test]
+    fn merge_bedrock_consumes_claurst_knowledge_base_tool_policy() {
+        let mut body = json!({});
+        merge_bedrock_options(
+            &mut body,
+            &json!({
+                "knowledgeBases": [{
+                    "name": "melange",
+                    "id": "KB12345678"
+                }],
+                "defaultKnowledgeBase": "melange",
+                "additionalModelRequestFields": {
+                    "top_k": 10
+                }
+            }),
+        );
+
+        assert!(body.get("knowledgeBases").is_none());
+        assert!(body.get("defaultKnowledgeBase").is_none());
         assert_eq!(body["additionalModelRequestFields"]["top_k"], json!(10));
     }
 }
