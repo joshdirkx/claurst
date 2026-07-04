@@ -401,6 +401,53 @@ pub fn describe_bedrock_knowledge_base_runtime(
     )
 }
 
+pub fn describe_bedrock_knowledge_base_status(
+    config: &claurst_core::config::Config,
+    provider_options_override: Option<&HashMap<String, Value>>,
+) -> Option<String> {
+    if !matches!(
+        config.provider.as_deref(),
+        Some("amazon-bedrock" | "bedrock-mantle")
+    ) {
+        return None;
+    }
+
+    let runtime = resolve_bedrock_knowledge_base_runtime(config, provider_options_override)?;
+    if runtime.is_configured() {
+        return Some(describe_bedrock_knowledge_base_runtime(&runtime));
+    }
+
+    let active_provider = config.provider.as_deref().unwrap_or("unknown");
+    let active_keys = provider_options_override
+        .or_else(|| {
+            config
+                .provider_configs
+                .get(active_provider)
+                .map(|provider| &provider.options)
+        })
+        .map(option_keys)
+        .unwrap_or_else(|| "none".to_string());
+    let bedrock_keys = config
+        .provider_configs
+        .get("amazon-bedrock")
+        .map(|provider| option_keys(&provider.options))
+        .unwrap_or_else(|| "provider entry missing".to_string());
+
+    Some(format!(
+        "Bedrock KB not configured: provider={}, active option keys={}, amazon-bedrock option keys={}. Expected defaultKnowledgeBase and knowledgeBases.",
+        active_provider, active_keys, bedrock_keys
+    ))
+}
+
+fn option_keys(options: &HashMap<String, Value>) -> String {
+    if options.is_empty() {
+        return "none".to_string();
+    }
+    let mut keys = options.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys.join(",")
+}
+
 fn parse_configured_knowledge_bases(
     provider_options: Option<&HashMap<String, Value>>,
 ) -> Vec<BedrockKnowledgeBaseConfig> {
@@ -694,6 +741,22 @@ mod tests {
         };
 
         assert!(resolve_bedrock_knowledge_base_runtime(&config, None).is_none());
+    }
+
+    #[test]
+    fn status_explains_missing_knowledge_base_options() {
+        let config = Config {
+            provider: Some("amazon-bedrock".to_string()),
+            ..Config::default()
+        };
+
+        let status = describe_bedrock_knowledge_base_status(&config, None)
+            .expect("bedrock status should be present");
+
+        assert!(status.contains("Bedrock KB not configured"));
+        assert!(status.contains("provider=amazon-bedrock"));
+        assert!(status.contains("provider entry missing"));
+        assert!(status.contains("Expected defaultKnowledgeBase and knowledgeBases"));
     }
 
     #[test]

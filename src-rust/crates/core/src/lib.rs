@@ -942,6 +942,7 @@ pub mod config {
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
@@ -977,7 +978,7 @@ pub mod config {
         #[serde(default)]
         pub provider: Option<String>,
         /// Per-provider configurations
-        #[serde(default)]
+        #[serde(default, alias = "providerConfigs")]
         pub provider_configs: HashMap<String, ProviderConfig>,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
@@ -1164,7 +1165,7 @@ pub mod config {
         #[serde(default)]
         pub provider: Option<String>,
         /// Per-provider configurations stored in settings.json.
-        #[serde(default)]
+        #[serde(default, alias = "provider_configs", alias = "providerConfigs")]
         pub providers: HashMap<String, ProviderConfig>,
         /// User-defined slash command templates.
         #[serde(default)]
@@ -1969,6 +1970,59 @@ pub mod config {
             let parsed: Config =
                 serde_json::from_value(value).expect("alias should parse");
             assert_eq!(parsed.request_timeout_secs, Some(900));
+        }
+
+        #[test]
+        fn provider_configs_camelcase_alias_also_parses() {
+            let parsed: Settings = serde_json::from_value(serde_json::json!({
+                "config": {
+                    "provider": "amazon-bedrock",
+                    "providerConfigs": {
+                        "amazon-bedrock": {
+                            "region": "us-west-2",
+                            "options": {
+                                "defaultKnowledgeBase": "project-kb",
+                                "knowledgeBases": [{
+                                    "name": "project-kb",
+                                    "id": "KB12345678"
+                                }]
+                            }
+                        }
+                    }
+                }
+            }))
+            .expect("camelCase providerConfigs should parse");
+
+            let config = parsed.effective_config();
+            let options = &config.provider_configs["amazon-bedrock"].options;
+            assert_eq!(options["defaultKnowledgeBase"], serde_json::json!("project-kb"));
+            assert!(options["knowledgeBases"].is_array());
+        }
+
+        #[test]
+        fn top_level_provider_configs_alias_merges_into_effective_config() {
+            let parsed: Settings = serde_json::from_value(serde_json::json!({
+                "provider": "amazon-bedrock",
+                "provider_configs": {
+                    "amazon-bedrock": {
+                        "region": "us-west-2",
+                        "options": {
+                            "defaultKnowledgeBase": "project-kb",
+                            "knowledgeBases": [{
+                                "name": "project-kb",
+                                "id": "KB12345678"
+                            }]
+                        }
+                    }
+                }
+            }))
+            .expect("top-level provider_configs alias should parse");
+
+            let config = parsed.effective_config();
+            let options = &config.provider_configs["amazon-bedrock"].options;
+            assert_eq!(config.provider.as_deref(), Some("amazon-bedrock"));
+            assert_eq!(options["defaultKnowledgeBase"], serde_json::json!("project-kb"));
+            assert!(options["knowledgeBases"].is_array());
         }
 
         #[test]
