@@ -45,9 +45,9 @@ use claurst_api::{
 use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
 use claurst_core::error::ClaudeError;
-use claurst_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
+use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo};
 use claurst_tools::{Tool, ToolContext, ToolResult};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -509,6 +509,424 @@ fn merge_configured_provider_options(
     }
 }
 
+const BEDROCK_KB_STANDARD_RETRIEVE_COST_USD: f64 = 0.001;
+const DEFAULT_BEDROCK_KB_AUTO_CONTEXT_CHARS: usize = 8_000;
+
+#[derive(Debug, Clone)]
+struct BedrockKbAutoRetrieveConfig {
+    name: Option<String>,
+    id: String,
+    description: Option<String>,
+    region: String,
+    number_of_results: u32,
+    max_context_chars: usize,
+    retrieval_configuration: Option<Value>,
+}
+
+async fn maybe_retrieve_bedrock_kb_context(
+    messages: &[Message],
+    tool_ctx: &ToolContext,
+    config: &QueryConfig,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    cost_tracker: &CostTracker,
+) -> Option<String> {
+    let kb_config = match resolve_bedrock_kb_auto_retrieve_config(tool_ctx, config) {
+        Ok(Some(config)) => config,
+        Ok(None) => return None,
+        Err(message) => {
+            warn!(error = %message, "Bedrock Knowledge Base auto-retrieve config invalid");
+            if let Some(tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "Bedrock Knowledge Base auto-retrieve skipped: {}",
+                    message
+                )));
+            }
+            return None;
+        }
+    };
+
+    let Some(query) = latest_user_text_for_bedrock_kb(messages) else {
+        return None;
+    };
+    let tool_id = "auto-bedrock-kb-retrieve".to_string();
+    let kb_label = kb_config.name.clone().unwrap_or_else(|| kb_config.id.clone());
+
+    if let Some(tx) = event_tx {
+        let _ = tx.send(QueryEvent::ToolStart {
+            tool_name: "BedrockKnowledgeBaseRetrieve".to_string(),
+            tool_id: tool_id.clone(),
+            input_json: json!({
+                "query": query.clone(),
+                "knowledge_base": kb_label,
+                "auto_retrieve": true
+            })
+            .to_string(),
+        });
+        let _ = tx.send(QueryEvent::Status(format!(
+            "Retrieving Bedrock Knowledge Base context from {}...",
+            kb_label
+        )));
+    }
+
+    let Some(client) = claurst_api::BedrockKnowledgeBaseClient::from_env_with_region(
+        kb_config.region.clone(),
+    ) else {
+        let message = "AWS credentials were not available for Bedrock Knowledge Base auto-retrieve";
+        warn!("{}", message);
+        if let Some(tx) = event_tx {
+            let _ = tx.send(QueryEvent::Status(message.to_string()));
+            let _ = tx.send(QueryEvent::ToolEnd {
+                tool_name: "BedrockKnowledgeBaseRetrieve".to_string(),
+                tool_id,
+                result: message.to_string(),
+                is_error: true,
+            });
+        }
+        return None;
+    };
+
+    let retrieval_configuration = kb_config
+        .retrieval_configuration
+        .clone()
+        .unwrap_or_else(|| {
+            json!({
+                "vectorSearchConfiguration": {
+                    "numberOfResults": kb_config.number_of_results
+                }
+            })
+        });
+
+    let response = match client
+        .retrieve(claurst_api::BedrockKnowledgeBaseRetrieveRequest {
+            knowledge_base_id: kb_config.id.clone(),
+            query,
+            retrieval_configuration: Some(retrieval_configuration),
+            next_token: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, "Bedrock Knowledge Base auto-retrieve failed");
+            if let Some(tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "Bedrock Knowledge Base auto-retrieve failed: {}",
+                    error
+                )));
+                let _ = tx.send(QueryEvent::ToolEnd {
+                    tool_name: "BedrockKnowledgeBaseRetrieve".to_string(),
+                    tool_id,
+                    result: format!("Bedrock Knowledge Base auto-retrieve failed: {}", error),
+                    is_error: true,
+                });
+            }
+            return None;
+        }
+    };
+
+    cost_tracker.add_service_cost_usd(BEDROCK_KB_STANDARD_RETRIEVE_COST_USD);
+
+    let result_count = response.retrieval_results.len();
+    if let Some(tx) = event_tx {
+        let result = format!(
+            "Retrieved {} Bedrock Knowledge Base chunk(s) from {}.",
+            result_count, kb_label
+        );
+        let _ = tx.send(QueryEvent::Status(format!(
+            "Retrieved {} Bedrock Knowledge Base chunk(s).",
+            result_count
+        )));
+        let _ = tx.send(QueryEvent::ToolEnd {
+            tool_name: "BedrockKnowledgeBaseRetrieve".to_string(),
+            tool_id,
+            result,
+            is_error: false,
+        });
+    }
+
+    Some(format_bedrock_kb_context(&kb_config, response))
+}
+
+fn resolve_bedrock_kb_auto_retrieve_config(
+    tool_ctx: &ToolContext,
+    config: &QueryConfig,
+) -> Result<Option<BedrockKbAutoRetrieveConfig>, String> {
+    if tool_ctx.config.provider.as_deref() != Some("amazon-bedrock") {
+        return Ok(None);
+    }
+
+    let Some(retrieval_options) = config.provider_options.get("knowledgeBaseRetrieval") else {
+        return Ok(None);
+    };
+    let Some(retrieval_options) = retrieval_options.as_object() else {
+        return Err("knowledgeBaseRetrieval must be an object".to_string());
+    };
+    if !retrieval_options
+        .get("autoRetrieve")
+        .or_else(|| retrieval_options.get("auto_retrieve"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let configured = configured_bedrock_knowledge_bases(&config.provider_options);
+    let requested = retrieval_options
+        .get("knowledgeBase")
+        .or_else(|| retrieval_options.get("knowledge_base"))
+        .or_else(|| retrieval_options.get("knowledgeBaseId"))
+        .or_else(|| retrieval_options.get("knowledge_base_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            config
+                .provider_options
+                .get("defaultKnowledgeBase")
+                .or_else(|| config.provider_options.get("default_knowledge_base"))
+                .and_then(Value::as_str)
+        });
+
+    let selected = select_bedrock_knowledge_base_for_query(requested, &configured)?;
+    let provider_region = tool_ctx
+        .config
+        .provider_configs
+        .get("amazon-bedrock")
+        .and_then(|provider| provider.region.clone())
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    let number_of_results = retrieval_options
+        .get("numberOfResults")
+        .or_else(|| retrieval_options.get("number_of_results"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .or(selected.number_of_results)
+        .unwrap_or(5)
+        .clamp(1, 20);
+    let max_context_chars = retrieval_options
+        .get("maxContextChars")
+        .or_else(|| retrieval_options.get("max_context_chars"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_BEDROCK_KB_AUTO_CONTEXT_CHARS);
+    let retrieval_configuration = retrieval_options
+        .get("retrievalConfiguration")
+        .or_else(|| retrieval_options.get("retrieval_configuration"))
+        .cloned()
+        .or_else(|| selected.retrieval_configuration.clone());
+
+    Ok(Some(BedrockKbAutoRetrieveConfig {
+        name: selected.name,
+        id: selected.id,
+        description: selected.description,
+        region: selected.region.unwrap_or(provider_region),
+        number_of_results,
+        max_context_chars,
+        retrieval_configuration,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredBedrockKnowledgeBase {
+    name: Option<String>,
+    id: String,
+    description: Option<String>,
+    region: Option<String>,
+    number_of_results: Option<u32>,
+    retrieval_configuration: Option<Value>,
+}
+
+fn configured_bedrock_knowledge_bases(
+    provider_options: &std::collections::HashMap<String, Value>,
+) -> Vec<ConfiguredBedrockKnowledgeBase> {
+    let mut configured = Vec::new();
+    for key in ["knowledgeBases", "knowledge_bases"] {
+        if let Some(items) = provider_options.get(key).and_then(Value::as_array) {
+            configured.extend(items.iter().filter_map(parse_bedrock_knowledge_base_config));
+        }
+    }
+    for key in ["knowledgeBase", "knowledge_base"] {
+        if let Some(item) = provider_options.get(key) {
+            if let Some(config) = parse_bedrock_knowledge_base_config(item) {
+                configured.push(config);
+            }
+        }
+    }
+    configured
+}
+
+fn parse_bedrock_knowledge_base_config(value: &Value) -> Option<ConfiguredBedrockKnowledgeBase> {
+    let obj = value.as_object()?;
+    let id = first_json_string(obj, &["id", "knowledgeBaseId", "knowledge_base_id"])?;
+    Some(ConfiguredBedrockKnowledgeBase {
+        name: first_json_string(obj, &["name", "alias"]),
+        id,
+        description: first_json_string(obj, &["description"]),
+        region: first_json_string(obj, &["region"]),
+        number_of_results: first_json_u32(obj, &["numberOfResults", "number_of_results"]),
+        retrieval_configuration: obj
+            .get("retrievalConfiguration")
+            .or_else(|| obj.get("retrieval_configuration"))
+            .cloned(),
+    })
+}
+
+fn select_bedrock_knowledge_base_for_query(
+    requested: Option<&str>,
+    configured: &[ConfiguredBedrockKnowledgeBase],
+) -> Result<ConfiguredBedrockKnowledgeBase, String> {
+    if let Some(requested) = requested.filter(|value| !value.trim().is_empty()) {
+        if let Some(config) = configured.iter().find(|config| {
+            config.id == requested || config.name.as_deref() == Some(requested)
+        }) {
+            return Ok(config.clone());
+        }
+        return Ok(ConfiguredBedrockKnowledgeBase {
+            name: None,
+            id: requested.to_string(),
+            description: None,
+            region: None,
+            number_of_results: None,
+            retrieval_configuration: None,
+        });
+    }
+
+    match configured {
+        [config] => Ok(config.clone()),
+        [] => Err(
+            "No Bedrock Knowledge Base configured. Add knowledgeBases or set knowledgeBaseRetrieval.knowledgeBase.".to_string(),
+        ),
+        _ => Err(
+            "Multiple Bedrock Knowledge Bases are configured. Set knowledgeBaseRetrieval.knowledgeBase.".to_string(),
+        ),
+    }
+}
+
+fn first_json_string(
+    obj: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn first_json_u32(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u32> {
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(Value::as_u64))
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn latest_user_text_for_bedrock_kb(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != Role::User {
+            return None;
+        }
+        match &message.content {
+            MessageContent::Text(text) => non_empty_trimmed(text),
+            MessageContent::Blocks(blocks) => {
+                let text = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                non_empty_trimmed(&text)
+            }
+        }
+    })
+}
+
+fn non_empty_trimmed(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn format_bedrock_kb_context(
+    config: &BedrockKbAutoRetrieveConfig,
+    response: claurst_api::BedrockKnowledgeBaseRetrieveResponse,
+) -> String {
+    let label = config.name.as_deref().unwrap_or(config.id.as_str());
+    let mut output = format!(
+        "<bedrock_knowledge_base_context name=\"{}\" id=\"{}\" region=\"{}\">\n",
+        escape_attr(label),
+        escape_attr(&config.id),
+        escape_attr(&config.region)
+    );
+    if let Some(description) = &config.description {
+        output.push_str(&format!("Description: {}\n", description.trim()));
+    }
+    if response.retrieval_results.is_empty() {
+        output.push_str("No relevant chunks were returned.\n");
+    }
+
+    let mut remaining = config.max_context_chars;
+    for (index, result) in response.retrieval_results.into_iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let Some(text) = result.text else {
+            continue;
+        };
+        let header = format!(
+            "\n[chunk {} score={} source={}]\n",
+            index + 1,
+            result
+                .score
+                .map(|score| format!("{score:.4}"))
+                .unwrap_or_else(|| "unknown".to_string()),
+            result
+                .document_id
+                .as_deref()
+                .unwrap_or("unknown")
+        );
+        append_limited(&mut output, &mut remaining, &header);
+        append_limited(&mut output, &mut remaining, text.trim());
+        append_limited(&mut output, &mut remaining, "\n");
+    }
+
+    output.push_str("</bedrock_knowledge_base_context>");
+    output
+}
+
+fn append_limited(output: &mut String, remaining: &mut usize, text: &str) {
+    if *remaining == 0 || text.is_empty() {
+        return;
+    }
+    let take = text
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(text.len()))
+        .take_while(|idx| *idx <= *remaining)
+        .last()
+        .unwrap_or(0);
+    if take > 0 {
+        output.push_str(&text[..take]);
+        *remaining -= take;
+    }
+    if take < text.len() && *remaining > 0 {
+        let marker = "\n[truncated]\n";
+        let marker_take = marker.len().min(*remaining);
+        output.push_str(&marker[..marker_take]);
+        *remaining -= marker_take;
+    }
+}
+
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Events emitted by the query loop for the TUI to render.
 #[derive(Debug, Clone)]
 pub enum QueryEvent {
@@ -819,6 +1237,7 @@ pub async fn run_query_loop(
     } else {
         None
     };
+    let mut bedrock_kb_auto_context: Option<String> = None;
 
     loop {
         turn += 1;
@@ -875,6 +1294,17 @@ pub async fn run_query_loop(
             }
         }
 
+        if turn == 1 {
+            bedrock_kb_auto_context = maybe_retrieve_bedrock_kb_context(
+                messages,
+                tool_ctx,
+                config,
+                event_tx.as_ref(),
+                cost_tracker.as_ref(),
+            )
+            .await;
+        }
+
         // Apply tool-result budget: if the cumulative size of all tool results
         // in the conversation exceeds the configured threshold, replace the
         // oldest results with a placeholder until we're back under budget.
@@ -923,6 +1353,13 @@ pub async fn run_query_loop(
                 }
             }
 
+            if let Some(ref kb_context) = bedrock_kb_auto_context {
+                patched.append_system_prompt = Some(match &patched.append_system_prompt {
+                    Some(existing) => format!("{}\n\n{}", existing, kb_context),
+                    None => kb_context.clone(),
+                });
+            }
+
             // If managed-agent mode is active, append orchestration instructions.
             if let Some(ref ma_config) = config.managed_agents {
                 if ma_config.enabled {
@@ -938,7 +1375,7 @@ pub async fn run_query_loop(
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
                 if !nudge.is_empty() {
-                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                    patched.append_system_prompt = Some(match &patched.append_system_prompt {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
                     });
@@ -2813,6 +3250,105 @@ mod tests {
             options["reasoningConfig"]["budgetTokens"],
             serde_json::json!(5_000)
         );
+    }
+
+    #[test]
+    fn test_bedrock_kb_auto_retrieve_config_parses_provider_options() {
+        let provider_options = std::collections::HashMap::from([
+            (
+                "knowledgeBaseRetrieval".to_string(),
+                serde_json::json!({
+                    "autoRetrieve": true,
+                    "numberOfResults": 4,
+                    "maxContextChars": 1200
+                }),
+            ),
+            (
+                "defaultKnowledgeBase".to_string(),
+                serde_json::json!("melange"),
+            ),
+            (
+                "knowledgeBases".to_string(),
+                serde_json::json!([
+                    {
+                        "name": "melange",
+                        "id": "KB12345678",
+                        "description": "Melange project knowledge",
+                        "region": "us-west-2",
+                        "numberOfResults": 3
+                    }
+                ]),
+            ),
+        ]);
+
+        let configured = configured_bedrock_knowledge_bases(&provider_options);
+        let selected = select_bedrock_knowledge_base_for_query(Some("melange"), &configured)
+            .expect("melange knowledge base should be selected");
+
+        assert_eq!(selected.id, "KB12345678");
+        assert_eq!(selected.region.as_deref(), Some("us-west-2"));
+        assert_eq!(selected.number_of_results, Some(3));
+    }
+
+    #[test]
+    fn test_latest_user_text_for_bedrock_kb_skips_tool_results() {
+        let messages = vec![
+            Message::user("first prompt"),
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: ToolResultContent::Text("tool output".to_string()),
+                    is_error: None,
+                }]),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            },
+            Message::user_blocks(vec![ContentBlock::Text {
+                text: "latest project context question".to_string(),
+            }]),
+        ];
+
+        assert_eq!(
+            latest_user_text_for_bedrock_kb(&messages).as_deref(),
+            Some("latest project context question")
+        );
+    }
+
+    #[test]
+    fn test_format_bedrock_kb_context_is_bounded() {
+        let config = BedrockKbAutoRetrieveConfig {
+            name: Some("melange".to_string()),
+            id: "KB12345678".to_string(),
+            description: Some("Melange project knowledge".to_string()),
+            region: "us-west-2".to_string(),
+            number_of_results: 5,
+            max_context_chars: 80,
+            retrieval_configuration: None,
+        };
+        let response = claurst_api::BedrockKnowledgeBaseRetrieveResponse {
+            guardrail_action: None,
+            next_token: None,
+            retrieval_results: vec![claurst_api::BedrockKnowledgeBaseRetrievalResult {
+                content_type: Some("TEXT".to_string()),
+                text: Some(format!(
+                    "{} SHOULD_NOT_APPEAR",
+                    "abcdefghijklmnopqrstuvwxyz0123456789".repeat(8)
+                )),
+                document_id: Some("docs/example.md".to_string()),
+                location: None,
+                metadata: None,
+                score: Some(0.88),
+            }],
+        };
+
+        let context = format_bedrock_kb_context(&config, response);
+
+        assert!(context.contains("<bedrock_knowledge_base_context"));
+        assert!(context.contains("docs/example.md"));
+        assert!(!context.contains("SHOULD_NOT_APPEAR"));
+        assert!(context.contains("</bedrock_knowledge_base_context>"));
     }
 
     #[test]
