@@ -771,6 +771,52 @@ fn resolve_bedrock_kb_auto_retrieve_config(
     }))
 }
 
+fn bedrock_kb_runtime_system_context(
+    tool_ctx: &ToolContext,
+    config: &QueryConfig,
+) -> Option<String> {
+    if !matches!(
+        tool_ctx.config.provider.as_deref(),
+        Some("amazon-bedrock" | "bedrock-mantle")
+    ) {
+        return None;
+    }
+
+    let amazon_bedrock_options = tool_ctx
+        .config
+        .provider_configs
+        .get("amazon-bedrock")
+        .map(|provider| &provider.options);
+    let mut configured = configured_bedrock_knowledge_bases(&config.provider_options);
+    if configured.is_empty() {
+        if let Some(options) = amazon_bedrock_options {
+            configured = configured_bedrock_knowledge_bases(options);
+        }
+    }
+    if configured.is_empty() {
+        return None;
+    }
+
+    let default_kb = config
+        .provider_options
+        .get("defaultKnowledgeBase")
+        .or_else(|| config.provider_options.get("default_knowledge_base"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            amazon_bedrock_options.and_then(|options| {
+                options
+                    .get("defaultKnowledgeBase")
+                    .or_else(|| options.get("default_knowledge_base"))
+                    .and_then(Value::as_str)
+            })
+        });
+
+    Some(format_bedrock_kb_runtime_system_context(
+        &configured,
+        default_kb,
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct ConfiguredBedrockKnowledgeBase {
     name: Option<String>,
@@ -970,6 +1016,44 @@ fn escape_attr(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn format_bedrock_kb_runtime_system_context(
+    configured: &[ConfiguredBedrockKnowledgeBase],
+    default_kb: Option<&str>,
+) -> String {
+    let labels = configured
+        .iter()
+        .map(|kb| kb.name.as_deref().unwrap_or(kb.id.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let default_text = default_kb
+        .map(|value| value.to_string())
+        .or_else(|| {
+            if configured.len() == 1 {
+                Some(
+                    configured[0]
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| configured[0].id.clone()),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "<bedrock_knowledge_base_runtime>\n\
+BedrockKnowledgeBaseRetrieve is configured for this session. \
+Configured Knowledge Base aliases or ids: {}. Default Knowledge Base: {}. \
+Use BedrockKnowledgeBaseRetrieve directly for Amazon Bedrock Knowledge Base retrieval; do not look for an MCP server. \
+When the user asks about AWS Bedrock Knowledge Bases, Melange project context, saved buildout context, infrastructure notes, design decisions, prompt caching, routing, or managed knowledge, call BedrockKnowledgeBaseRetrieve before answering. \
+Omit knowledge_base when the default is appropriate.\n\
+</bedrock_knowledge_base_runtime>",
+        labels,
+        default_text
+    )
 }
 
 /// Events emitted by the query loop for the TUI to render.
@@ -1396,6 +1480,13 @@ pub async fn run_query_loop(
                         None => agent_prompt.clone(),
                     });
                 }
+            }
+
+            if let Some(runtime_context) = bedrock_kb_runtime_system_context(tool_ctx, config) {
+                patched.append_system_prompt = Some(match &patched.append_system_prompt {
+                    Some(existing) => format!("{}\n\n{}", existing, runtime_context),
+                    None => runtime_context,
+                });
             }
 
             if let Some(ref kb_context) = bedrock_kb_auto_context {
@@ -3394,6 +3485,25 @@ mod tests {
         assert!(context.contains("docs/example.md"));
         assert!(!context.contains("SHOULD_NOT_APPEAR"));
         assert!(context.contains("</bedrock_knowledge_base_context>"));
+    }
+
+    #[test]
+    fn test_bedrock_kb_runtime_context_lists_default_alias() {
+        let configured = vec![ConfiguredBedrockKnowledgeBase {
+            name: Some("melange".to_string()),
+            id: "KB12345678".to_string(),
+            description: Some("Melange project knowledge".to_string()),
+            region: Some("us-west-2".to_string()),
+            number_of_results: Some(5),
+            retrieval_configuration: None,
+        }];
+
+        let context = format_bedrock_kb_runtime_system_context(&configured, Some("melange"));
+
+        assert!(context.contains("BedrockKnowledgeBaseRetrieve is configured"));
+        assert!(context.contains("melange"));
+        assert!(context.contains("do not look for an MCP server"));
+        assert!(context.contains("Omit knowledge_base"));
     }
 
     #[test]
