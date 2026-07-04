@@ -327,7 +327,7 @@ impl BedrockProvider {
         }
 
         // Tool definitions.
-        if !request.tools.is_empty() {
+        if !request.tools.is_empty() && Self::model_supports_tool_config(&request.model) {
             let tool_specs: Vec<Value> = request
                 .tools
                 .iter()
@@ -347,6 +347,10 @@ impl BedrockProvider {
         }
 
         if let Some(thinking) = &request.thinking {
+            if !Self::model_supports_reasoning_config(&request.model) {
+                merge_bedrock_options(&mut body, &request.provider_options);
+                return body;
+            }
             body["reasoningConfig"] = json!({
                 "type": "enabled",
                 "budgetTokens": thinking.budget_tokens,
@@ -373,6 +377,16 @@ impl BedrockProvider {
     }
 
     fn model_supports_stop_sequences(model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        model.contains("anthropic") || model.contains("claude")
+    }
+
+    fn model_supports_tool_config(model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        model.contains("anthropic") || model.contains("claude") || model.contains("nova")
+    }
+
+    fn model_supports_reasoning_config(model: &str) -> bool {
         let model = model.to_ascii_lowercase();
         model.contains("anthropic") || model.contains("claude")
     }
@@ -1176,7 +1190,8 @@ fn parse_bedrock_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::{Message, MessageContent};
+    use crate::ThinkingConfig;
+    use claurst_core::types::{Message, MessageContent, ToolDefinition};
 
     fn test_provider() -> BedrockProvider {
         BedrockProvider {
@@ -1209,6 +1224,20 @@ mod tests {
             stop_sequences: vec!["</stop>".to_string()],
             thinking: None,
             provider_options: json!({}),
+        }
+    }
+
+    fn test_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"]
+            }),
         }
     }
 
@@ -1268,6 +1297,46 @@ mod tests {
         ));
 
         assert_eq!(body["inferenceConfig"]["stopSequences"], json!(["</stop>"]));
+    }
+
+    #[test]
+    fn converse_body_omits_tool_config_for_qwen_models() {
+        let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        request.tools = vec![test_tool()];
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        assert!(body.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn converse_body_keeps_tool_config_for_nova_models() {
+        let mut request = test_request("amazon.nova-2-lite-v1:0");
+        request.tools = vec![test_tool()];
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        assert!(body["toolConfig"]["tools"].is_array());
+    }
+
+    #[test]
+    fn converse_body_omits_reasoning_config_for_deepseek_models() {
+        let mut request = test_request("deepseek.v3.2");
+        request.thinking = Some(ThinkingConfig::enabled(1024));
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        assert!(body.get("reasoningConfig").is_none());
+    }
+
+    #[test]
+    fn converse_body_keeps_reasoning_config_for_anthropic_models() {
+        let mut request = test_request("anthropic.claude-sonnet-4-6-v1");
+        request.thinking = Some(ThinkingConfig::enabled(1024));
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        assert_eq!(body["reasoningConfig"]["budgetTokens"], json!(1024));
     }
 
     #[test]

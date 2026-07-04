@@ -349,14 +349,6 @@ fn build_provider_options(
                     }),
                 );
             }
-        } else if let Some(level) = effort_level {
-            options.insert(
-                "reasoningConfig".to_string(),
-                serde_json::json!({
-                    "type": "enabled",
-                    "maxReasoningEffort": reasoning_effort_for_level(level),
-                }),
-            );
         }
     }
 
@@ -2513,6 +2505,27 @@ mod tests {
             options["reasoningConfig"]["budgetTokens"],
             serde_json::json!(10_000)
         );
+    }
+
+    #[test]
+    fn test_build_provider_options_for_bedrock_open_models_omit_reasoning_config() {
+        for model in [
+            "qwen.qwen3-coder-30b-a3b-v1:0",
+            "deepseek.v3.2",
+            "meta.llama3-3-70b-instruct-v1:0",
+            "amazon.nova-2-lite-v1:0",
+        ] {
+            let options = build_provider_options(
+                "amazon-bedrock",
+                model,
+                Some(claurst_core::effort::EffortLevel::High),
+                Some(10_000),
+            );
+            assert!(
+                options.get("reasoningConfig").is_none(),
+                "{model} should not receive Claude-style reasoningConfig"
+            );
+        }
     }
 
     #[test]
