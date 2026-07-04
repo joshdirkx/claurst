@@ -8,8 +8,8 @@
 //   POST https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse-stream
 //
 // Auth:
-//   - If AWS_BEARER_TOKEN_BEDROCK is set: Authorization: Bearer <token>
-//   - Otherwise: AWS SigV4 signed request using access key + secret
+//   - If AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set: AWS SigV4
+//   - Otherwise, if AWS_BEARER_TOKEN_BEDROCK is set: Authorization: Bearer <token>
 //
 // Only Claude models on Bedrock are officially supported by this adapter.
 
@@ -59,32 +59,16 @@ impl BedrockProvider {
             .build()
             .expect("failed to build reqwest client");
 
-        // Bearer token takes priority over SigV4 credentials.
-        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-            return Some(Self {
-                id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
-                region,
-                http_client,
-                access_key_id: None,
-                secret_access_key: None,
-                session_token: None,
-                bearer_token: Some(token),
-            });
-        }
-
-        // Standard SigV4 credentials.
-        let key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
-        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
-        let session = std::env::var("AWS_SESSION_TOKEN").ok();
+        let auth = Self::auth_from_env()?;
 
         Some(Self {
             id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
             region,
             http_client,
-            access_key_id: Some(key),
-            secret_access_key: Some(secret),
-            session_token: session,
-            bearer_token: None,
+            access_key_id: auth.access_key_id,
+            secret_access_key: auth.secret_access_key,
+            session_token: auth.session_token,
+            bearer_token: auth.bearer_token,
         })
     }
 
@@ -97,30 +81,48 @@ impl BedrockProvider {
             .build()
             .expect("failed to build reqwest client");
 
-        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-            return Some(Self {
-                id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
-                region,
-                http_client,
-                access_key_id: None,
-                secret_access_key: None,
-                session_token: None,
-                bearer_token: Some(token),
-            });
-        }
-
-        let key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
-        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
-        let session = std::env::var("AWS_SESSION_TOKEN").ok();
+        let auth = Self::auth_from_env()?;
 
         Some(Self {
             id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
             region,
             http_client,
-            access_key_id: Some(key),
-            secret_access_key: Some(secret),
-            session_token: session,
-            bearer_token: None,
+            access_key_id: auth.access_key_id,
+            secret_access_key: auth.secret_access_key,
+            session_token: auth.session_token,
+            bearer_token: auth.bearer_token,
+        })
+    }
+
+    fn auth_from_env() -> Option<BedrockAuth> {
+        Self::auth_from_values(
+            non_empty_env("AWS_ACCESS_KEY_ID"),
+            non_empty_env("AWS_SECRET_ACCESS_KEY"),
+            non_empty_env("AWS_SESSION_TOKEN"),
+            non_empty_env("AWS_BEARER_TOKEN_BEDROCK"),
+        )
+    }
+
+    fn auth_from_values(
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+        session_token: Option<String>,
+        bearer_token: Option<String>,
+    ) -> Option<BedrockAuth> {
+        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
+            return Some(BedrockAuth {
+                access_key_id: Some(access_key_id),
+                secret_access_key: Some(secret_access_key),
+                session_token,
+                bearer_token: None,
+            });
+        }
+
+        bearer_token.map(|token| BedrockAuth {
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            bearer_token: Some(token),
         })
     }
 
@@ -666,6 +668,17 @@ impl BedrockProvider {
     }
 }
 
+struct BedrockAuth {
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    bearer_token: Option<String>,
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // LlmProvider impl
 // ---------------------------------------------------------------------------
@@ -1126,4 +1139,84 @@ fn parse_bedrock_event(
     }
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_provider() -> BedrockProvider {
+        BedrockProvider {
+            id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+            region: "us-west-2".to_string(),
+            http_client: reqwest::Client::new(),
+            access_key_id: Some("AKIATESTACCESSKEY".to_string()),
+            secret_access_key: Some("test-secret-key".to_string()),
+            session_token: Some("test-session-token".to_string()),
+            bearer_token: None,
+        }
+    }
+
+    #[test]
+    fn bedrock_auth_prefers_sigv4_credentials_over_bearer_token() {
+        let auth = BedrockProvider::auth_from_values(
+            Some("AKIATESTACCESSKEY".to_string()),
+            Some("test-secret-key".to_string()),
+            Some("test-session-token".to_string()),
+            Some("bedrock-bearer-token".to_string()),
+        )
+        .expect("auth should be configured");
+
+        assert_eq!(auth.access_key_id.as_deref(), Some("AKIATESTACCESSKEY"));
+        assert_eq!(auth.secret_access_key.as_deref(), Some("test-secret-key"));
+        assert_eq!(auth.session_token.as_deref(), Some("test-session-token"));
+        assert!(auth.bearer_token.is_none());
+    }
+
+    #[test]
+    fn bedrock_auth_uses_bearer_token_only_without_sigv4_credentials() {
+        let auth = BedrockProvider::auth_from_values(
+            None,
+            None,
+            None,
+            Some("bedrock-bearer-token".to_string()),
+        )
+        .expect("auth should be configured");
+
+        assert!(auth.access_key_id.is_none());
+        assert!(auth.secret_access_key.is_none());
+        assert!(auth.session_token.is_none());
+        assert_eq!(auth.bearer_token.as_deref(), Some("bedrock-bearer-token"));
+    }
+
+    #[test]
+    fn sign_request_uses_aws_sigv4_authorization_header() {
+        let provider = test_provider();
+        let signed = provider.sign_request(
+            "POST",
+            "https://bedrock-runtime.us-west-2.amazonaws.com/model/qwen.qwen3-coder-30b-a3b-v1%3A0/converse",
+            r#"{"messages":[]}"#,
+            &chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+
+        let authorization = signed
+            .get("Authorization")
+            .expect("Authorization header should be signed");
+
+        assert!(authorization.starts_with("AWS4-HMAC-SHA256 "));
+        assert!(authorization.contains(
+            "Credential=AKIATESTACCESSKEY/20260102/us-west-2/bedrock/aws4_request"
+        ));
+        assert!(authorization.contains(
+            "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+        ));
+        assert!(authorization.contains("Signature="));
+        assert_eq!(signed.get("x-amz-date").map(String::as_str), Some("20260102T030405Z"));
+        assert_eq!(
+            signed.get("x-amz-security-token").map(String::as_str),
+            Some("test-session-token")
+        );
+    }
 }
