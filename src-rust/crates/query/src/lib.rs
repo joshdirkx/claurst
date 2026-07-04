@@ -670,32 +670,40 @@ fn resolve_bedrock_kb_auto_retrieve_config(
                 None
             }
         });
-    let Some(retrieval_options_value) = retrieval_options_value else {
-        return Ok(None);
-    };
-    let Some(retrieval_options) = retrieval_options_value.as_object() else {
-        return Err("knowledgeBaseRetrieval must be an object".to_string());
-    };
-    if !retrieval_options
-        .get("autoRetrieve")
-        .or_else(|| retrieval_options.get("auto_retrieve"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(None);
-    }
-
     let mut configured = configured_bedrock_knowledge_bases(&config.provider_options);
     if configured.is_empty() {
         if let Some(options) = amazon_bedrock_options {
             configured = configured_bedrock_knowledge_bases(options);
         }
     }
+    let retrieval_options = match retrieval_options_value {
+        Some(value) => Some(
+            value
+                .as_object()
+                .ok_or_else(|| "knowledgeBaseRetrieval must be an object".to_string())?,
+        ),
+        None => None,
+    };
+    let auto_retrieve = retrieval_options
+        .and_then(|options| {
+            options
+                .get("autoRetrieve")
+                .or_else(|| options.get("auto_retrieve"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(!configured.is_empty());
+    if !auto_retrieve || !active_provider_is_bedrock {
+        return Ok(None);
+    }
+
     let requested = retrieval_options
-        .get("knowledgeBase")
-        .or_else(|| retrieval_options.get("knowledge_base"))
-        .or_else(|| retrieval_options.get("knowledgeBaseId"))
-        .or_else(|| retrieval_options.get("knowledge_base_id"))
+        .and_then(|options| {
+            options
+                .get("knowledgeBase")
+                .or_else(|| options.get("knowledge_base"))
+                .or_else(|| options.get("knowledgeBaseId"))
+                .or_else(|| options.get("knowledge_base_id"))
+        })
         .and_then(Value::as_str)
         .or_else(|| {
             config
@@ -724,22 +732,31 @@ fn resolve_bedrock_kb_auto_retrieve_config(
         .unwrap_or_else(|| "us-east-1".to_string());
 
     let number_of_results = retrieval_options
-        .get("numberOfResults")
-        .or_else(|| retrieval_options.get("number_of_results"))
+        .and_then(|options| {
+            options
+                .get("numberOfResults")
+                .or_else(|| options.get("number_of_results"))
+        })
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .or(selected.number_of_results)
         .unwrap_or(5)
         .clamp(1, 20);
     let max_context_chars = retrieval_options
-        .get("maxContextChars")
-        .or_else(|| retrieval_options.get("max_context_chars"))
+        .and_then(|options| {
+            options
+                .get("maxContextChars")
+                .or_else(|| options.get("max_context_chars"))
+        })
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(DEFAULT_BEDROCK_KB_AUTO_CONTEXT_CHARS);
     let retrieval_configuration = retrieval_options
-        .get("retrievalConfiguration")
-        .or_else(|| retrieval_options.get("retrieval_configuration"))
+        .and_then(|options| {
+            options
+                .get("retrievalConfiguration")
+                .or_else(|| options.get("retrieval_configuration"))
+        })
         .cloned()
         .or_else(|| selected.retrieval_configuration.clone());
 
