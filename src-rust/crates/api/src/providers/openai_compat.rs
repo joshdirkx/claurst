@@ -985,6 +985,12 @@ impl LlmProvider for OpenAiCompatProvider {
                     let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
                         Some(c) => c,
                         None => {
+                            // Bedrock Mantle and other OpenAI-compatible
+                            // providers can emit a final usage-only chunk
+                            // instead of attaching usage to a choice delta.
+                            // Preserve it so the TUI cost/context meter still
+                            // updates even when there is no assistant text in
+                            // that specific SSE frame.
                             if let Some(usage_val) = chunk_json.get("usage") {
                                 let usage = OpenAiProvider::parse_usage_pub(Some(usage_val));
                                 yield Ok(StreamEvent::MessageDelta {
@@ -998,7 +1004,19 @@ impl LlmProvider for OpenAiCompatProvider {
 
                     let choice = match choices.first() {
                         Some(c) => c,
-                        None => continue,
+                        None => {
+                            // Same usage-only terminal chunk as above, but in
+                            // the OpenAI shape where `choices` exists and is
+                            // intentionally empty.
+                            if let Some(usage_val) = chunk_json.get("usage") {
+                                let usage = OpenAiProvider::parse_usage_pub(Some(usage_val));
+                                yield Ok(StreamEvent::MessageDelta {
+                                    stop_reason: None,
+                                    usage: Some(usage),
+                                });
+                            }
+                            continue;
+                        }
                     };
 
                     let delta = match choice.get("delta") {

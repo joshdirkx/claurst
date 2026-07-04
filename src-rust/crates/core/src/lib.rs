@@ -3466,7 +3466,7 @@ pub mod cost {
     }
 
     /// Per-model pricing tiers (USD per million tokens).
-    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct ModelPricing {
         pub input_per_mtk: f64,
         pub output_per_mtk: f64,
@@ -3507,6 +3507,37 @@ pub mod cost {
             cache_read_per_mtk: 0.0,
         };
 
+        // Bedrock open-model prices are static fallbacks used until the AWS
+        // Price List resolver refreshes the active model. Keep them in core so
+        // cost tracking works immediately and remains useful offline.
+        pub const BEDROCK_QWEN_CODER_30B: Self = Self {
+            input_per_mtk: 0.1545,
+            output_per_mtk: 0.6180,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        };
+
+        pub const BEDROCK_QWEN_235B: Self = Self {
+            input_per_mtk: 0.2266,
+            output_per_mtk: 0.9064,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        };
+
+        pub const BEDROCK_QWEN_NEXT: Self = Self {
+            input_per_mtk: 0.15,
+            output_per_mtk: 1.20,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        };
+
+        pub const BEDROCK_DEEPSEEK_V32: Self = Self {
+            input_per_mtk: 0.62,
+            output_per_mtk: 1.85,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        };
+
         /// Default pricing is Opus (most capable, highest cost).
         pub fn default_pricing() -> Self {
             Self::OPUS
@@ -3514,14 +3545,32 @@ pub mod cost {
 
         /// Pick pricing based on model name substring matching.
         pub fn for_model(model: &str) -> Self {
+            let normalized = model.to_ascii_lowercase();
             // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
-            if model.ends_with("-free") || model.starts_with("free/") {
+            if normalized.ends_with("-free") || normalized.starts_with("free/") {
                 Self::FREE
-            } else if is_free_upstream_model(model) {
+            } else if is_free_upstream_model(&normalized) {
                 Self::FREE
-            } else if model.contains("opus") {
+            } else if normalized.contains("qwen3-coder-30b")
+                || normalized.contains("qwen.qwen3-coder-30b")
+                || normalized.contains("qwen3-coder-30b-a3b")
+            {
+                Self::BEDROCK_QWEN_CODER_30B
+            } else if normalized.contains("qwen3-235b")
+                || normalized.contains("qwen.qwen3-235b")
+            {
+                Self::BEDROCK_QWEN_235B
+            } else if normalized.contains("qwen3-next")
+                || normalized.contains("qwen3-coder-next")
+            {
+                Self::BEDROCK_QWEN_NEXT
+            } else if normalized.contains("deepseek.v3.2")
+                || normalized.contains("deepseek-v3.2")
+            {
+                Self::BEDROCK_DEEPSEEK_V32
+            } else if normalized.contains("opus") {
                 Self::OPUS
-            } else if model.contains("haiku") {
+            } else if normalized.contains("haiku") {
                 Self::HAIKU
             } else {
                 // Default to Sonnet pricing for unknown models
@@ -3564,6 +3613,10 @@ pub mod cost {
 
         pub fn set_model(&self, model: &str) {
             *self.pricing.write() = ModelPricing::for_model(model);
+        }
+
+        pub fn set_pricing(&self, pricing: ModelPricing) {
+            *self.pricing.write() = pricing;
         }
 
         pub fn add_usage(
@@ -4847,6 +4900,21 @@ mod tests {
         tracker.add_usage(1000, 500, 200, 100);
         // Free models should have zero cost even with token usage
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_cost_tracker_bedrock_pricing_override() {
+        let tracker = CostTracker::with_model("qwen.qwen3-coder-30b-a3b-v1:0");
+        tracker.add_usage(1_000_000, 1_000_000, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 0.7725);
+
+        tracker.set_pricing(cost::ModelPricing {
+            input_per_mtk: 1.0,
+            output_per_mtk: 2.0,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        });
+        assert_eq!(tracker.total_cost_usd(), 3.0);
     }
 
     #[test]

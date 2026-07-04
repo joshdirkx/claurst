@@ -97,6 +97,12 @@ pub(crate) fn merge_bedrock_options(body: &mut Value, provider_options: &Value) 
 
     for (key, value) in options_obj {
         match key.as_str() {
+            "promptCaching" => {
+                // `promptCaching` is a Claurst-side convenience policy. The
+                // Bedrock Converse API does not accept that object directly;
+                // the Bedrock provider turns it into concrete `cachePoint`
+                // content blocks at the stable tool/system/message boundaries.
+            }
             "inferenceConfig" | "toolConfig" | "reasoningConfig" | "additionalModelRequestFields" => {
                 match (body_obj.get_mut(key), value) {
                     (Some(Value::Object(target_obj)), Value::Object(source_obj)) => {
@@ -181,5 +187,26 @@ mod tests {
         assert!(body["toolConfig"]["tools"].is_array());
         assert_eq!(body["toolConfig"]["toolChoice"]["auto"], json!({}));
         assert_eq!(body["reasoningConfig"]["budgetTokens"], json!(1000));
+    }
+
+    #[test]
+    fn merge_bedrock_consumes_claurst_prompt_caching_policy() {
+        let mut body = json!({});
+        merge_bedrock_options(
+            &mut body,
+            &json!({
+                "promptCaching": {
+                    "tools": true,
+                    "system": true,
+                    "ttl": "5m"
+                },
+                "additionalModelRequestFields": {
+                    "top_k": 10
+                }
+            }),
+        );
+
+        assert!(body.get("promptCaching").is_none());
+        assert_eq!(body["additionalModelRequestFields"]["top_k"], json!(10));
     }
 }

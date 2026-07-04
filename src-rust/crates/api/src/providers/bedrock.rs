@@ -297,7 +297,8 @@ impl BedrockProvider {
     // -----------------------------------------------------------------------
 
     fn build_converse_body(request: &ProviderRequest) -> Value {
-        let messages = Self::build_converse_messages(request);
+        let prompt_cache = BedrockPromptCachingOptions::from_provider_options(&request.provider_options);
+        let messages = Self::build_converse_messages(request, &prompt_cache);
         let mut body = json!({
             "messages": messages,
             "inferenceConfig": {
@@ -323,12 +324,21 @@ impl BedrockProvider {
                     .collect::<Vec<_>>()
                     .join("\n"),
             };
-            body["system"] = json!([{ "text": sys_text }]);
+            let mut system = vec![json!({ "text": sys_text })];
+            if prompt_cache.cache_system {
+                // System instructions are usually stable across an agent
+                // session, so this is the first high-value cache boundary.
+                // Bedrock counts cache points across tools -> system ->
+                // messages; putting the marker here preserves the stable
+                // prefix without guessing about user-message volatility.
+                system.push(prompt_cache.cache_point());
+            }
+            body["system"] = json!(system);
         }
 
         // Tool definitions.
         if !request.tools.is_empty() && Self::model_supports_tool_config(&request.model) {
-            let tool_specs: Vec<Value> = request
+            let mut tool_specs: Vec<Value> = request
                 .tools
                 .iter()
                 .map(|td| {
@@ -343,11 +353,21 @@ impl BedrockProvider {
                     })
                 })
                 .collect();
+            if prompt_cache.cache_tools {
+                // Tool schemas are another stable prefix for coding agents.
+                // Caching them is especially useful before Knowledge Base and
+                // routing work adds more fixed tool definitions to each turn.
+                tool_specs.push(prompt_cache.cache_point());
+            }
             body["toolConfig"] = json!({ "tools": tool_specs });
         }
 
         if let Some(thinking) = &request.thinking {
             if !Self::model_supports_reasoning_config(&request.model) {
+                // Qwen/DeepSeek/Nova Bedrock models reject Claude-style
+                // reasoningConfig. Preserve provider_options so callers can
+                // still pass family-specific Bedrock fields, but do not send
+                // the incompatible reasoning block.
                 merge_bedrock_options(&mut body, &request.provider_options);
                 return body;
             }
@@ -362,7 +382,10 @@ impl BedrockProvider {
         body
     }
 
-    fn build_converse_messages(request: &ProviderRequest) -> Vec<Value> {
+    fn build_converse_messages(
+        request: &ProviderRequest,
+        prompt_cache: &BedrockPromptCachingOptions,
+    ) -> Vec<Value> {
         remove_empty_messages(&request.messages)
             .iter()
             .map(|msg| {
@@ -370,7 +393,14 @@ impl BedrockProvider {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                 };
-                let content = Self::message_content_to_converse(&msg.content, &msg.role);
+                let mut content = Self::message_content_to_converse(&msg.content, &msg.role);
+                if prompt_cache.cache_messages && !content.is_empty() {
+                    // Message checkpoints are opt-in because coding turns
+                    // usually change at the tail. This keeps the default cache
+                    // policy focused on stable tools/system content while
+                    // still allowing long static prompt prefixes to be cached.
+                    content.push(prompt_cache.cache_point());
+                }
                 json!({ "role": role, "content": content })
             })
             .collect()
@@ -378,11 +408,17 @@ impl BedrockProvider {
 
     fn model_supports_stop_sequences(model: &str) -> bool {
         let model = model.to_ascii_lowercase();
+        // Converse accepts stopSequences generically, but several Bedrock
+        // open-model adapters reject the field. Keep it only for Claude-family
+        // models where it is known to be accepted.
         model.contains("anthropic") || model.contains("claude")
     }
 
     fn model_supports_tool_config(model: &str) -> bool {
         let model = model.to_ascii_lowercase();
+        // This is deliberately allow-listed by family. DeepSeek currently
+        // fails better when toolConfig is absent, while Qwen and Nova need the
+        // tool schema preserved to perform real agent/tool turns.
         model.contains("anthropic")
             || model.contains("claude")
             || model.contains("nova")
@@ -391,6 +427,8 @@ impl BedrockProvider {
 
     fn model_supports_reasoning_config(model: &str) -> bool {
         let model = model.to_ascii_lowercase();
+        // `reasoningConfig` is the Bedrock Claude thinking surface. Other
+        // families expose reasoning differently or reject the field outright.
         model.contains("anthropic") || model.contains("claude")
     }
 
@@ -676,18 +714,108 @@ impl BedrockProvider {
             Some(v) => v,
             None => return UsageInfo::default(),
         };
-        UsageInfo {
-            input_tokens: u
-                .get("inputTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: u
-                .get("outputTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+        parse_bedrock_usage_info(u)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BedrockPromptCachingOptions {
+    cache_tools: bool,
+    cache_system: bool,
+    cache_messages: bool,
+    ttl: Option<String>,
+}
+
+impl BedrockPromptCachingOptions {
+    fn disabled() -> Self {
+        Self {
+            cache_tools: false,
+            cache_system: false,
+            cache_messages: false,
+            ttl: None,
         }
+    }
+
+    fn from_provider_options(provider_options: &Value) -> Self {
+        let Some(value) = provider_options.get("promptCaching") else {
+            return Self::disabled();
+        };
+        if value.as_bool() == Some(false) {
+            return Self::disabled();
+        }
+
+        let mut options = Self {
+            cache_tools: true,
+            cache_system: true,
+            cache_messages: false,
+            ttl: None,
+        };
+
+        if value.as_bool() == Some(true) {
+            return options;
+        }
+
+        let Some(obj) = value.as_object() else {
+            return Self::disabled();
+        };
+        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return Self::disabled();
+        }
+        options.cache_tools = obj
+            .get("tools")
+            .or_else(|| obj.get("cacheTools"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        options.cache_system = obj
+            .get("system")
+            .or_else(|| obj.get("cacheSystem"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        options.cache_messages = obj
+            .get("messages")
+            .or_else(|| obj.get("cacheMessages"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        options.ttl = obj
+            .get("ttl")
+            .and_then(Value::as_str)
+            .filter(|ttl| matches!(*ttl, "5m" | "1h"))
+            .map(str::to_string);
+        options
+    }
+
+    fn cache_point(&self) -> Value {
+        let mut cache_point = json!({ "type": "default" });
+        if let Some(ttl) = self.ttl.as_deref() {
+            cache_point["ttl"] = json!(ttl);
+        }
+        json!({ "cachePoint": cache_point })
+    }
+}
+
+fn parse_bedrock_usage_info(u: &Value) -> UsageInfo {
+    // Bedrock prompt caching splits input accounting: `inputTokens` is only
+    // uncached input, while cache reads and writes are separate billable
+    // counters. Mapping them into Claurst's generic cache fields keeps the TUI
+    // context/cost meter accurate for Bedrock without changing other providers.
+    UsageInfo {
+        input_tokens: u
+            .get("inputTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output_tokens: u
+            .get("outputTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation_input_tokens: u
+            .get("cacheWriteInputTokens")
+            .or_else(|| u.get("cacheCreationInputTokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_read_input_tokens: u
+            .get("cacheReadInputTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     }
 }
 
@@ -1141,25 +1269,24 @@ fn parse_bedrock_event(
             stop_reason: Some(stop_reason),
             usage: None,
         }));
-        events.push(Ok(StreamEvent::MessageStop));
+        // Do not emit MessageStop here. Bedrock can send the terminal usage
+        // metadata after `messageStop`; ending the stream immediately loses
+        // cost/context data and can overwrite a `tool_use` turn with a plain
+        // stop before the query loop gets the full accounting.
         return events;
     }
 
-    // metadata (usage)
-    if let Some(metadata) = val.get("metadata") {
+    // metadata (usage) — flat payload when event_type is present, wrapped otherwise.
+    // The live EventStream decoder sees flat payloads from the AWS binary
+    // frame, while tests and some compatibility paths use the wrapped shape.
+    let metadata = if event_type == Some("metadata") {
+        Some(val)
+    } else {
+        val.get("metadata")
+    };
+    if let Some(metadata) = metadata {
         if let Some(usage_val) = metadata.get("usage") {
-            let usage = UsageInfo {
-                input_tokens: usage_val
-                    .get("inputTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                output_tokens: usage_val
-                    .get("outputTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            };
+            let usage = parse_bedrock_usage_info(usage_val);
             events.push(Ok(StreamEvent::MessageDelta {
                 stop_reason: None,
                 usage: Some(usage),
@@ -1323,6 +1450,51 @@ mod tests {
     }
 
     #[test]
+    fn converse_body_adds_prompt_cache_points_when_enabled() {
+        let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        request.system_prompt = Some(SystemPrompt::Text("You are Claurst.".to_string()));
+        request.tools = vec![test_tool()];
+        request.provider_options = json!({
+            "promptCaching": {
+                "tools": true,
+                "system": true,
+                "ttl": "5m"
+            }
+        });
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        let tools = body["toolConfig"]["tools"].as_array().expect("tools array");
+        assert!(tools.iter().any(|tool| tool.get("cachePoint").is_some()));
+        let system = body["system"].as_array().expect("system array");
+        assert!(system.iter().any(|block| block.get("cachePoint").is_some()));
+        assert_eq!(system[1]["cachePoint"]["ttl"], json!("5m"));
+        assert!(body.get("promptCaching").is_none());
+    }
+
+    #[test]
+    fn converse_body_keeps_message_cache_points_opt_in() {
+        let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        request.provider_options = json!({ "promptCaching": true });
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        let content = body["messages"][0]["content"].as_array().expect("content array");
+        assert!(content.iter().all(|block| block.get("cachePoint").is_none()));
+
+        request.provider_options = json!({
+            "promptCaching": {
+                "messages": true,
+                "tools": false,
+                "system": false
+            }
+        });
+        let body = BedrockProvider::build_converse_body(&request);
+        let content = body["messages"][0]["content"].as_array().expect("content array");
+        assert!(content.iter().any(|block| block.get("cachePoint").is_some()));
+    }
+
+    #[test]
     fn converse_body_omits_reasoning_config_for_deepseek_models() {
         let mut request = test_request("deepseek.v3.2");
         request.thinking = Some(ThinkingConfig::enabled(1024));
@@ -1371,5 +1543,66 @@ mod tests {
             signed.get("x-amz-security-token").map(String::as_str),
             Some("test-session-token")
         );
+    }
+
+    #[test]
+    fn parse_converse_usage_maps_bedrock_cache_tokens() {
+        let usage = BedrockProvider::parse_converse_usage(Some(&json!({
+            "inputTokens": 100,
+            "outputTokens": 40,
+            "cacheWriteInputTokens": 30,
+            "cacheReadInputTokens": 20
+        })));
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+        assert_eq!(usage.cache_read_input_tokens, 20);
+    }
+
+    #[test]
+    fn stream_message_stop_waits_for_later_metadata_usage() {
+        let provider_id = ProviderId::new(ProviderId::AMAZON_BEDROCK);
+        let mut message_started = true;
+        let stop_events = parse_bedrock_event(
+            &json!({ "stopReason": "tool_use" }),
+            Some("messageStop"),
+            &provider_id,
+            &mut message_started,
+        );
+
+        assert_eq!(stop_events.len(), 1);
+        assert!(matches!(
+            stop_events[0].as_ref().expect("event"),
+            StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                usage: None
+            }
+        ));
+
+        let usage_events = parse_bedrock_event(
+            &json!({
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 40,
+                    "cacheWriteInputTokens": 30,
+                    "cacheReadInputTokens": 20
+                }
+            }),
+            Some("metadata"),
+            &provider_id,
+            &mut message_started,
+        );
+        let StreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: Some(usage),
+        } = usage_events[0].as_ref().expect("usage event")
+        else {
+            panic!("expected usage delta");
+        };
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+        assert_eq!(usage.cache_read_input_tokens, 20);
     }
 }

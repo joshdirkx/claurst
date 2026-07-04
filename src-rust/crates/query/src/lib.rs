@@ -117,6 +117,13 @@ pub struct QueryConfig {
     /// this registry contains that provider, the registry's provider is used
     /// instead of `AnthropicClient`.
     pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+    /// Provider-specific request options for the active provider.
+    ///
+    /// This is intentionally copied into QueryConfig as the selected provider's
+    /// options instead of carrying the full app config table through the query
+    /// crate. Bedrock uses this to enable policy features such as
+    /// `promptCaching` while keeping provider quirks local to request building.
+    pub provider_options: std::collections::HashMap<String, serde_json::Value>,
     /// Active agent name (e.g., "build", "plan", "explore", or None for default).
     pub agent_name: Option<String>,
     /// Resolved agent definition for the current session.
@@ -148,6 +155,7 @@ impl Default for QueryConfig {
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
+            provider_options: std::collections::HashMap::new(),
             agent_name: None,
             agent_definition: None,
             model_registry: None,
@@ -158,6 +166,12 @@ impl Default for QueryConfig {
 
 impl QueryConfig {
     pub fn from_config(cfg: &Config) -> Self {
+        let provider_options = cfg
+            .provider
+            .as_deref()
+            .and_then(|provider| cfg.provider_configs.get(provider))
+            .map(|provider_cfg| provider_cfg.options.clone())
+            .unwrap_or_default();
         Self {
             model: cfg.effective_model().to_string(),
             max_tokens: cfg.effective_max_tokens(),
@@ -167,6 +181,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            provider_options,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -179,6 +194,12 @@ impl QueryConfig {
     pub fn from_config_with_registry(cfg: &Config, registry: &claurst_api::ModelRegistry) -> Self {
         // We can't move the Arc here, but we need a clone for the query loop.
         // Callers typically wrap the registry in an Arc already.
+        let provider_options = cfg
+            .provider
+            .as_deref()
+            .and_then(|provider| cfg.provider_configs.get(provider))
+            .map(|provider_cfg| provider_cfg.options.clone())
+            .unwrap_or_default();
         Self {
             model: claurst_api::effective_model_for_config(cfg, registry),
             max_tokens: cfg.effective_max_tokens(),
@@ -188,6 +209,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            provider_options,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -458,6 +480,32 @@ fn build_provider_options(
         Value::Null
     } else {
         Value::Object(options)
+    }
+}
+
+fn merge_configured_provider_options(
+    provider_options: &mut Value,
+    configured_options: Option<&std::collections::HashMap<String, Value>>,
+) {
+    let Some(configured_options) = configured_options else {
+        return;
+    };
+    if configured_options.is_empty() {
+        return;
+    }
+
+    if !provider_options.is_object() {
+        *provider_options = Value::Object(serde_json::Map::new());
+    }
+    let options = provider_options
+        .as_object_mut()
+        .expect("provider_options was normalized to an object");
+    for (key, value) in configured_options {
+        // Provider config is the user's explicit per-provider policy surface.
+        // Merge it after generated compatibility options so Bedrock features
+        // like `promptCaching` can be enabled without changing query-loop
+        // defaults or affecting other providers.
+        options.insert(key.clone(), value.clone());
     }
 }
 
@@ -1126,6 +1174,17 @@ pub async fn run_query_loop(
                         })
                         .collect();
 
+                    let mut provider_options = build_provider_options(
+                        &provider_id_str,
+                        &model_id_str,
+                        config.effort_level,
+                        effective_thinking_budget,
+                    );
+                    merge_configured_provider_options(
+                        &mut provider_options,
+                        Some(&config.provider_options),
+                    );
+
                     let provider_request = claurst_api::ProviderRequest {
                         model: model_id_str.to_owned(),
                         messages: provider_messages,
@@ -1142,12 +1201,7 @@ pub async fn run_query_loop(
                         } else {
                             None
                         },
-                        provider_options: build_provider_options(
-                            &provider_id_str,
-                            &model_id_str,
-                            config.effort_level,
-                            effective_thinking_budget,
-                        ),
+                        provider_options,
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -1233,17 +1287,37 @@ pub async fn run_query_loop(
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
-                                                stop_str = match stop_reason {
-                                                    Some(claurst_api::provider_types::StopReason::ToolUse) => "tool_use".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::MaxTokens) => "max_tokens".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::StopSequence) => "stop_sequence".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::ContentFiltered) => "content_filtered".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::EndTurn) => "end_turn".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::Other(s)) => s.clone(),
-                                                    None => "end_turn".to_string(),
-                                                };
+                                                if let Some(stop_reason) = stop_reason {
+                                                    // Some providers send a
+                                                    // later usage-only delta
+                                                    // after the semantic stop
+                                                    // reason. Only replace the
+                                                    // stop string when a real
+                                                    // stop reason is present
+                                                    // so tool turns survive
+                                                    // final accounting frames.
+                                                    stop_str = match stop_reason {
+                                                        claurst_api::provider_types::StopReason::ToolUse => "tool_use".to_string(),
+                                                        claurst_api::provider_types::StopReason::MaxTokens => "max_tokens".to_string(),
+                                                        claurst_api::provider_types::StopReason::StopSequence => "stop_sequence".to_string(),
+                                                        claurst_api::provider_types::StopReason::ContentFiltered => "content_filtered".to_string(),
+                                                        claurst_api::provider_types::StopReason::EndTurn => "end_turn".to_string(),
+                                                        claurst_api::provider_types::StopReason::Other(s) => s.clone(),
+                                                    };
+                                                }
                                                 if let Some(u) = u {
+                                                    // Replace the complete
+                                                    // usage snapshot rather
+                                                    // than adding deltas. The
+                                                    // Bedrock metadata event
+                                                    // arrives after content and
+                                                    // includes uncached input,
+                                                    // cache writes, cache
+                                                    // reads, and output totals.
+                                                    usage.input_tokens = u.input_tokens;
                                                     usage.output_tokens = u.output_tokens;
+                                                    usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                                    usage.cache_read_input_tokens = u.cache_read_input_tokens;
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageStop => break,
@@ -2298,6 +2372,7 @@ mod tests {
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
+            provider_options: std::collections::HashMap::new(),
             agent_name: None,
             agent_definition: None,
             model_registry: None,
@@ -2526,6 +2601,34 @@ mod tests {
                 "{model} should not receive Claude-style reasoningConfig"
             );
         }
+    }
+
+    #[test]
+    fn test_configured_provider_options_merge_after_generated_options() {
+        let mut options = build_provider_options(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-6-v1",
+            Some(claurst_core::effort::EffortLevel::High),
+            Some(10_000),
+        );
+        let configured = std::collections::HashMap::from([
+            (
+                "promptCaching".to_string(),
+                serde_json::json!({
+                    "tools": true,
+                    "system": true
+                }),
+            ),
+            ("reasoningConfig".to_string(), serde_json::json!({ "budgetTokens": 5_000 })),
+        ]);
+
+        merge_configured_provider_options(&mut options, Some(&configured));
+
+        assert_eq!(options["promptCaching"]["tools"], serde_json::json!(true));
+        assert_eq!(
+            options["reasoningConfig"]["budgetTokens"],
+            serde_json::json!(5_000)
+        );
     }
 
     #[test]

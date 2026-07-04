@@ -363,6 +363,7 @@ impl Tool for AgentTool {
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: Some(Arc::new(provider_registry)),
+            provider_options: std::collections::HashMap::new(),
             agent_name: None,
             agent_definition: None,
             model_registry: Some(model_registry),

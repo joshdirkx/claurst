@@ -1261,7 +1261,7 @@ impl App {
         let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
-        Self {
+        let app = Self {
             config,
             cost_tracker,
             messages: Vec::new(),
@@ -1493,7 +1493,9 @@ impl App {
             managed_agents_active: false,
             last_exit_key_warning: None,
             exit_key_sequence_start: None,
-        }
+        };
+        app.refresh_pricing_for_active_model();
+        app
     }
 
     /// Load token budget from environment or model defaults.
@@ -1826,6 +1828,55 @@ impl App {
         }
     }
 
+    fn bedrock_region_for_pricing(&self) -> String {
+        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+        self.config
+            .provider_configs
+            .get(provider)
+            .and_then(|cfg| cfg.region.as_deref())
+            .map(str::to_owned)
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".to_string())
+    }
+
+    fn refresh_pricing_for_active_model(&self) {
+        Self::spawn_bedrock_pricing_refresh(
+            self.config.provider.clone(),
+            self.model_name.clone(),
+            self.bedrock_region_for_pricing(),
+            self.cost_tracker.clone(),
+        );
+    }
+
+    fn spawn_bedrock_pricing_refresh(
+        provider: Option<String>,
+        model: String,
+        region: String,
+        cost_tracker: Arc<CostTracker>,
+    ) {
+        let Some(provider) = provider else {
+            return;
+        };
+        if provider != "amazon-bedrock" && provider != "bedrock-mantle" {
+            return;
+        }
+        // Pricing is best-effort and should never block launching a session.
+        // When a Tokio runtime is available, refresh from AWS Price List in
+        // the background and let the static model pricing act as the immediate
+        // fallback for tests, offline use, or expired SSO credentials.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            if let Some(pricing) =
+                claurst_api::bedrock_pricing::resolve_bedrock_pricing(&model, &region).await
+            {
+                cost_tracker.set_pricing(pricing);
+            }
+        });
+    }
+
     /// Switch the active provider while clearing any explicit model override.
     fn set_provider_default(&mut self, provider_id: String) {
         self.config.provider = Some(provider_id.clone());
@@ -1835,6 +1886,7 @@ impl App {
         self.cost_tracker.set_model(&model);
         self.model_name = model;
         self.refresh_context_window_size();
+        self.refresh_pricing_for_active_model();
         self.context_used_tokens = 0;
     }
 
@@ -1972,6 +2024,7 @@ impl App {
             self.config.provider = Some(provider);
         }
         self.refresh_context_window_size();
+        self.refresh_pricing_for_active_model();
         // Reset used tokens when switching models (context is fresh).
         self.context_used_tokens = 0;
     }
@@ -2022,6 +2075,7 @@ impl App {
         self.fast_mode = false;
         self.model_name = self.config.effective_model().to_string();
         self.cost_tracker.set_model(&self.model_name);
+        self.refresh_pricing_for_active_model();
         self.status_message = Some(status_message);
         self.clear_prompt();
     }
