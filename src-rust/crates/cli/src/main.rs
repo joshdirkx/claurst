@@ -162,6 +162,10 @@ struct Cli {
     #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
     verbose: bool,
 
+    /// Enable redacted provider diagnostics in the UI/output stream
+    #[arg(long = "debug", action = ArgAction::SetTrue)]
+    debug: bool,
+
     /// API key for the active provider (overrides provider-specific env vars)
     #[arg(long = "api-key")]
     api_key: Option<String>,
@@ -797,6 +801,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.display().to_string());
+    query_config.debug_provider = cli.debug;
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -1514,6 +1519,29 @@ async fn run_headless(
                     eprintln!("{}", ev);
                 } else {
                     eprintln!("\nError: {}", msg);
+                }
+            }
+            QueryEvent::ProviderDebug(info) => {
+                if is_json_output {
+                    let ev = serde_json::json!({
+                        "type": "provider_debug",
+                        "provider": info.provider,
+                        "model": info.model,
+                        "kind": info.kind,
+                        "message": info.message,
+                        "data": info.data,
+                    });
+                    println!("{}", ev);
+                } else {
+                    let data = serde_json::to_string(&info.data)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    eprintln!(
+                        "\n[debug] {} {}: {} {}",
+                        info.provider,
+                        info.kind,
+                        info.message,
+                        data
+                    );
                 }
             }
             _ => {}

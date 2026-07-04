@@ -130,6 +130,12 @@ pub struct QueryConfig {
     /// crate. Bedrock uses this to enable policy features such as
     /// `promptCaching` while keeping provider quirks local to request building.
     pub provider_options: std::collections::HashMap<String, serde_json::Value>,
+    /// Emit redacted provider diagnostics into the event stream.
+    ///
+    /// This is intentionally runtime-only and defaults off: the diagnostic data is
+    /// useful for validating provider features such as Bedrock prompt caching, but
+    /// it should not alter request behavior or leak full prompt/request payloads.
+    pub debug_provider: bool,
     /// Active agent name (e.g., "build", "plan", "explore", or None for default).
     pub agent_name: Option<String>,
     /// Resolved agent definition for the current session.
@@ -162,6 +168,7 @@ impl Default for QueryConfig {
             fallback_model: None,
             provider_registry: None,
             provider_options: std::collections::HashMap::new(),
+            debug_provider: false,
             agent_name: None,
             agent_definition: None,
             model_registry: None,
@@ -973,6 +980,8 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// Redacted provider diagnostic emitted only when explicitly enabled.
+    ProviderDebug(claurst_api::ProviderDebugInfo),
 }
 
 // ---------------------------------------------------------------------------
@@ -1680,6 +1689,7 @@ pub async fn run_query_loop(
                             None
                         },
                         provider_options,
+                        debug_provider: config.debug_provider,
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -1782,6 +1792,13 @@ pub async fn run_query_loop(
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageStop => break,
+                                            claurst_api::StreamEvent::ProviderDebug(info) => {
+                                                if config.debug_provider {
+                                                    if let Some(ref tx) = event_tx {
+                                                        let _ = tx.send(QueryEvent::ProviderDebug(info.clone()));
+                                                    }
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1914,6 +1931,31 @@ pub async fn run_query_loop(
                     }
 
                     if let Some(ref tx) = event_tx {
+                        if config.debug_provider {
+                            let _ = tx.send(QueryEvent::ProviderDebug(
+                                claurst_api::ProviderDebugInfo {
+                                    provider: provider_id_str.to_string(),
+                                    model: model_id_str.to_string(),
+                                    kind: "usage".to_string(),
+                                    message: format!(
+                                        "usage: in={} out={} cache_write={} cache_read={}",
+                                        usage.input_tokens,
+                                        usage.output_tokens,
+                                        usage.cache_creation_input_tokens,
+                                        usage.cache_read_input_tokens
+                                    ),
+                                    data: json!({
+                                        "input_tokens": usage.input_tokens,
+                                        "output_tokens": usage.output_tokens,
+                                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                                        "total_input_billed_tokens": usage.input_tokens
+                                            + usage.cache_creation_input_tokens
+                                            + usage.cache_read_input_tokens,
+                                    }),
+                                },
+                            ));
+                        }
                         let _ = tx.send(QueryEvent::TurnComplete {
                             stop_reason: stop_str.clone(),
                             turn,
@@ -2937,6 +2979,7 @@ fn map_to_anthropic_event(
             })
         }
         StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
+        StreamEvent::ProviderDebug(_) => None,
         StreamEvent::Error { error_type, message } => {
             Some(AnthropicStreamEvent::Error {
                 error_type: error_type.clone(),

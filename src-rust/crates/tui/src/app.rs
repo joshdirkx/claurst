@@ -446,6 +446,7 @@ pub enum TimelineEventKind {
     AskUser,
     McpApproval,
     Elicitation,
+    ProviderDebug,
 }
 
 /// Non-message transcript event shown inline with the current turn.
@@ -1889,6 +1890,22 @@ impl App {
         );
         self.permission_timeline_events
             .insert(pr.tool_use_id.clone(), id);
+    }
+
+    pub fn record_provider_debug(&mut self, info: claurst_api::ProviderDebugInfo) {
+        let preview = serde_json::to_string(&info.data)
+            .ok()
+            .filter(|text| text != "null" && text != "{}");
+        let id = self.push_timeline_event(
+            TimelineEventKind::ProviderDebug,
+            None,
+            "Provider debug",
+            format!("{} · {}", info.provider, info.model),
+            info.message,
+            preview,
+            Vec::new(),
+        );
+        self.resolve_timeline_event(id, TimelineEventStatus::Submitted, Some(info.kind));
     }
 
     pub fn record_permission_resolution(
@@ -6768,6 +6785,10 @@ impl App {
                     self.status_message = None;
                 }
                 self.refresh_turn_diff_from_history();
+            }
+
+            QueryEvent::ProviderDebug(info) => {
+                self.record_provider_debug(info);
             }
 
             QueryEvent::TurnComplete { turn, stop_reason, usage, .. } => {

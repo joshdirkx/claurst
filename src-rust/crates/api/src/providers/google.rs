@@ -996,6 +996,7 @@ mod tests {
             stop_sequences: vec![],
             thinking: None,
             provider_options: json!({}),
+            debug_provider: false,
         }
     }
 

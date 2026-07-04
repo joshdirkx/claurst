@@ -1313,6 +1313,7 @@ fn render_timeline_event_lines(event: &TimelineEvent, width: u16) -> Vec<Line<'s
         TimelineEventKind::AskUser => "question",
         TimelineEventKind::McpApproval => "mcp",
         TimelineEventKind::Elicitation => "input",
+        TimelineEventKind::ProviderDebug => "debug",
     };
     let mut lines = Vec::new();
     let subject = if event.subject.is_empty() {

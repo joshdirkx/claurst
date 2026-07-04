@@ -91,6 +91,12 @@ pub struct ProviderRequest {
     /// Defaults to an empty JSON object `{}`.
     #[serde(default)]
     pub provider_options: Value,
+
+    /// Emit provider diagnostics such as redacted request-shape and usage
+    /// details. Providers must keep these diagnostics free of prompt text,
+    /// credentials, headers, and full request/response bodies.
+    #[serde(default)]
+    pub debug_provider: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +120,17 @@ pub struct ProviderResponse {
 
     /// The model that produced this response (as reported by the provider).
     pub model: String,
+}
+
+/// Redacted provider diagnostic that can be surfaced in CLI/TUI debug mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderDebugInfo {
+    pub provider: String,
+    pub model: String,
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub data: Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +193,9 @@ pub enum StreamEvent {
 
     /// The message stream is fully complete.
     MessageStop,
+
+    /// Redacted provider diagnostic emitted only when explicitly requested.
+    ProviderDebug(ProviderDebugInfo),
 
     /// A provider-level error occurred mid-stream.
     Error {

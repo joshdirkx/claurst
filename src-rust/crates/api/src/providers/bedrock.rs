@@ -27,7 +27,7 @@ use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
+    ProviderCapabilities, ProviderDebugInfo, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
     StreamEvent, SystemPrompt, SystemPromptStyle,
 };
 
@@ -562,20 +562,49 @@ impl BedrockProvider {
     async fn send_streaming(
         &self,
         request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(reqwest::Response, Vec<ProviderDebugInfo>), ProviderError> {
+        let mut debug_events = Vec::new();
+        if request.debug_provider {
+            debug_events.push(self.prompt_cache_debug_info(
+                request,
+                "prompt_cache_probe",
+                "initial",
+                None,
+            ));
+        }
+
         match self.send_streaming_once(request).await {
+            Ok(resp) => Ok((resp, debug_events)),
             Err(error)
                 if Self::prompt_cache_for_request(request).is_enabled()
                     && Self::is_prompt_caching_unsupported_error(&error) =>
             {
                 debug!(
                     model = %request.model,
-                    "Bedrock rejected prompt caching; retrying request without cache points"
-                );
+	                    "Bedrock rejected prompt caching; retrying request without cache points"
+	                );
+                if request.debug_provider {
+                    debug_events.push(self.prompt_cache_debug_info(
+                        request,
+                        "prompt_cache_rejected",
+                        "initial",
+                        Some("Bedrock rejected prompt cache points; retrying without them"),
+                    ));
+                }
                 let fallback = Self::request_without_prompt_caching(request);
-                self.send_streaming_once(&fallback).await
+                if fallback.debug_provider {
+                    debug_events.push(self.prompt_cache_debug_info(
+                        &fallback,
+                        "prompt_cache_probe",
+                        "fallback_without_cache",
+                        None,
+                    ));
+                }
+                self.send_streaming_once(&fallback)
+                    .await
+                    .map(|resp| (resp, debug_events))
             }
-            result => result,
+            Err(error) => Err(error),
         }
     }
 
@@ -713,6 +742,57 @@ impl BedrockProvider {
             }
         }
         fallback
+    }
+
+    fn prompt_cache_debug_info(
+        &self,
+        request: &ProviderRequest,
+        kind: &str,
+        attempt: &str,
+        override_message: Option<&str>,
+    ) -> ProviderDebugInfo {
+        let requested_cache =
+            BedrockPromptCachingOptions::from_provider_options(&request.provider_options);
+        let effective_cache = Self::prompt_cache_for_request(request);
+        let body = Self::build_converse_body(request);
+        let cache_points = count_bedrock_cache_points(&body);
+        let total_cache_points =
+            cache_points.tools + cache_points.system + cache_points.messages;
+        let message = override_message.map(str::to_string).unwrap_or_else(|| {
+            if effective_cache.is_enabled() {
+                format!(
+                    "prompt cache probe: tools={} system={} messages={}",
+                    cache_points.tools, cache_points.system, cache_points.messages
+                )
+            } else if requested_cache.is_enabled() {
+                "prompt cache requested but not enabled for this model policy".to_string()
+            } else {
+                "prompt cache disabled for request".to_string()
+            }
+        });
+
+        ProviderDebugInfo {
+            provider: self.id.to_string(),
+            model: request.model.clone(),
+            kind: kind.to_string(),
+            message,
+            data: json!({
+                "attempt": attempt,
+                "region": self.region,
+                "requested_enabled": requested_cache.is_enabled(),
+                "effective_enabled": effective_cache.is_enabled(),
+                "experimental_open_models": requested_cache.experimental_open_models,
+                "supported_family": Self::model_supports_prompt_caching(&request.model),
+                "open_family_candidate": Self::model_is_open_family_prompt_cache_candidate(&request.model),
+                "ttl": effective_cache.ttl,
+                "cache_points": {
+                    "tools": cache_points.tools,
+                    "system": cache_points.system,
+                    "messages": cache_points.messages,
+                    "total": total_cache_points,
+                },
+            }),
+        }
     }
 
     fn is_prompt_caching_unsupported_error(error: &ProviderError) -> bool {
@@ -923,6 +1003,50 @@ impl BedrockPromptCachingOptions {
         }
         json!({ "cachePoint": cache_point })
     }
+}
+
+#[derive(Debug, Default)]
+struct BedrockCachePointCounts {
+    tools: usize,
+    system: usize,
+    messages: usize,
+}
+
+fn count_bedrock_cache_points(body: &Value) -> BedrockCachePointCounts {
+    let tools = body
+        .get("toolConfig")
+        .and_then(|tool_config| tool_config.get("tools"))
+        .and_then(Value::as_array)
+        .map(|items| count_cache_points(items.iter()))
+        .unwrap_or(0);
+    let system = body
+        .get("system")
+        .and_then(Value::as_array)
+        .map(|items| count_cache_points(items.iter()))
+        .unwrap_or(0);
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_array))
+                .map(|content| count_cache_points(content.iter()))
+                .sum()
+        })
+        .unwrap_or(0);
+
+    BedrockCachePointCounts {
+        tools,
+        system,
+        messages,
+    }
+}
+
+fn count_cache_points<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
+    items
+        .filter(|item| item.get("cachePoint").is_some())
+        .count()
 }
 
 fn split_tagged_thinking_content(text: &str) -> Vec<ContentBlock> {
@@ -1145,7 +1269,7 @@ impl LlmProvider for BedrockProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let resp = self.send_streaming(&request).await?;
+        let (resp, debug_events) = self.send_streaming(&request).await?;
         let provider_id = self.id.clone();
 
         // Bedrock Converse streaming uses AWS EventStream binary framing.
@@ -1157,6 +1281,10 @@ impl LlmProvider for BedrockProvider {
         // in the raw bytes, which works reliably for the common text delta events.
         let s = stream! {
             use futures::StreamExt;
+
+            for info in debug_events {
+                yield Ok(StreamEvent::ProviderDebug(info));
+            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
@@ -1626,6 +1754,7 @@ mod tests {
             stop_sequences: vec!["</stop>".to_string()],
             thinking: None,
             provider_options: json!({}),
+            debug_provider: false,
         }
     }
 
@@ -1826,6 +1955,40 @@ mod tests {
             );
             assert!(body.get("promptCaching").is_none());
         }
+    }
+
+    #[test]
+    fn prompt_cache_debug_info_reports_redacted_cache_shape() {
+        let provider = test_provider();
+        let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        request.system_prompt = Some(SystemPrompt::Text("You are Claurst.".to_string()));
+        request.tools = vec![test_tool()];
+        request.provider_options = json!({
+            "promptCaching": {
+                "tools": true,
+                "system": true,
+                "messages": true,
+                "experimentalOpenModels": true,
+                "ttl": "5m"
+            }
+        });
+
+        let info = provider.prompt_cache_debug_info(
+            &request,
+            "prompt_cache_probe",
+            "initial",
+            None,
+        );
+
+        assert_eq!(info.kind, "prompt_cache_probe");
+        assert_eq!(info.data["requested_enabled"], json!(true));
+        assert_eq!(info.data["effective_enabled"], json!(true));
+        assert_eq!(info.data["cache_points"]["tools"], json!(1));
+        assert_eq!(info.data["cache_points"]["system"], json!(1));
+        assert_eq!(info.data["cache_points"]["messages"], json!(1));
+        let serialized = serde_json::to_string(&info).expect("debug info serializes");
+        assert!(!serialized.contains("You are Claurst"));
+        assert!(!serialized.contains("read_file"));
     }
 
     #[test]

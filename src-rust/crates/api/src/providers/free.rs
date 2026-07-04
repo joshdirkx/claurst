@@ -533,6 +533,7 @@ mod tests {
             stop_sequences: Vec::new(),
             thinking: None,
             provider_options: serde_json::Value::Null,
+            debug_provider: false,
         }
     }
 
