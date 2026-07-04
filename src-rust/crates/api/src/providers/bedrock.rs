@@ -305,9 +305,13 @@ impl BedrockProvider {
                 "temperature": request.temperature.unwrap_or(0.7),
                 // topP omitted: Bedrock Claude rejects requests that specify
                 // both temperature and topP simultaneously.
-                "stopSequences": request.stop_sequences,
             }
         });
+        if !request.stop_sequences.is_empty()
+            && Self::model_supports_stop_sequences(&request.model)
+        {
+            body["inferenceConfig"]["stopSequences"] = json!(request.stop_sequences);
+        }
 
         // System prompt.
         if let Some(sys) = &request.system_prompt {
@@ -366,6 +370,11 @@ impl BedrockProvider {
                 json!({ "role": role, "content": content })
             })
             .collect()
+    }
+
+    fn model_supports_stop_sequences(model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        model.contains("anthropic") || model.contains("claude")
     }
 
     fn message_content_to_converse(content: &MessageContent, role: &Role) -> Vec<Value> {
@@ -1167,6 +1176,7 @@ fn parse_bedrock_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claurst_core::types::{Message, MessageContent};
 
     fn test_provider() -> BedrockProvider {
         BedrockProvider {
@@ -1177,6 +1187,28 @@ mod tests {
             secret_access_key: Some("test-secret-key".to_string()),
             session_token: Some("test-session-token".to_string()),
             bearer_token: None,
+        }
+    }
+
+    fn test_request(model: &str) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hello".to_string()),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            }],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 16,
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec!["</stop>".to_string()],
+            thinking: None,
+            provider_options: json!({}),
         }
     }
 
@@ -1218,6 +1250,24 @@ mod tests {
             sigv4_canonical_uri("/model/qwen.qwen3-coder-30b-a3b-v1%3A0/converse-stream"),
             "/model/qwen.qwen3-coder-30b-a3b-v1%253A0/converse-stream"
         );
+    }
+
+    #[test]
+    fn converse_body_omits_stop_sequences_for_qwen_models() {
+        let body = BedrockProvider::build_converse_body(&test_request(
+            "qwen.qwen3-coder-30b-a3b-v1:0",
+        ));
+
+        assert!(body["inferenceConfig"].get("stopSequences").is_none());
+    }
+
+    #[test]
+    fn converse_body_keeps_stop_sequences_for_anthropic_models() {
+        let body = BedrockProvider::build_converse_body(&test_request(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        ));
+
+        assert_eq!(body["inferenceConfig"]["stopSequences"], json!(["</stop>"]));
     }
 
     #[test]
