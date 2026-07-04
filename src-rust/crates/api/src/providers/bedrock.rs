@@ -1613,6 +1613,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_support_is_family_gated() {
+        for model in [
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "amazon.nova-lite-v1:0",
+            "amazon.nova-2-lite-v1:0",
+        ] {
+            assert!(
+                BedrockProvider::model_supports_prompt_caching(model),
+                "{model} should allow explicit Bedrock cache points"
+            );
+        }
+
+        for model in [
+            "qwen.qwen3-coder-30b-a3b-v1:0",
+            "deepseek.v3.2",
+            "us.meta.llama3-3-70b-instruct-v1:0",
+        ] {
+            assert!(
+                !BedrockProvider::model_supports_prompt_caching(model),
+                "{model} should not receive explicit Bedrock cache points"
+            );
+        }
+    }
+
+    #[test]
     fn converse_body_adds_prompt_cache_points_when_enabled() {
         let mut request = test_request("amazon.nova-2-lite-v1:0");
         request.system_prompt = Some(SystemPrompt::Text("You are Claurst.".to_string()));
