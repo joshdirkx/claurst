@@ -50,6 +50,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
+        "bedrock-mantle" => Some(bedrock_mantle()),
         _ => None,
     }
 }
@@ -281,6 +282,64 @@ pub fn qwen() -> OpenAiCompatProvider {
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
         default_temperature: Some(0.55),
+        ..Default::default()
+    })
+}
+
+/// Amazon Bedrock Mantle — OpenAI-compatible Bedrock endpoint.
+///
+/// Reads `BEDROCK_MANTLE_API_KEY`, falling back to `AWS_BEARER_TOKEN_BEDROCK`.
+/// Resolves the region from `providers.bedrock-mantle.region`, then
+/// `AWS_REGION`, `AWS_DEFAULT_REGION`, and finally `us-east-1`.
+pub fn bedrock_mantle() -> OpenAiCompatProvider {
+    let settings = Settings::load_sync().unwrap_or_default();
+    let region = settings
+        .providers
+        .get("bedrock-mantle")
+        .and_then(|config| config.region.as_deref())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("AWS_REGION")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "us-east-1".to_string());
+    bedrock_mantle_with_region(region)
+}
+
+pub fn bedrock_mantle_with_region(region: impl Into<String>) -> OpenAiCompatProvider {
+    let base_url = format!("https://bedrock-mantle.{}.api.aws/v1", region.into());
+    let key = std::env::var("BEDROCK_MANTLE_API_KEY")
+        .or_else(|_| std::env::var("AWS_BEARER_TOKEN_BEDROCK"))
+        .unwrap_or_default();
+
+    OpenAiCompatProvider::new(
+        ProviderId::BEDROCK_MANTLE,
+        "Amazon Bedrock Mantle",
+        base_url,
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        model_aliases: vec![
+            (
+                "qwen.qwen3-coder-30b-a3b-v1:0".to_string(),
+                "qwen.qwen3-coder-30b-a3b-instruct".to_string(),
+            ),
+            (
+                "qwen.qwen3-coder-480b-a35b-v1:0".to_string(),
+                "qwen.qwen3-coder-480b-a35b-instruct".to_string(),
+            ),
+            (
+                "qwen.qwen3-32b-v1:0".to_string(),
+                "qwen.qwen3-32b".to_string(),
+            ),
+        ],
         ..Default::default()
     })
 }
@@ -622,5 +681,27 @@ mod tests {
         let qwen = provider_for_id("qwen").expect("qwen should resolve");
         assert_eq!(alibaba.id(), qwen.id());
         assert_eq!(alibaba.name(), qwen.name());
+    }
+
+    #[test]
+    fn bedrock_mantle_resolves_as_openai_compatible_provider() {
+        let provider = provider_for_id("bedrock-mantle").expect("bedrock-mantle should resolve");
+
+        assert_eq!(provider.id(), ProviderId::BEDROCK_MANTLE);
+        assert_eq!(provider.name(), "Amazon Bedrock Mantle");
+    }
+
+    #[test]
+    fn bedrock_mantle_rewrites_runtime_qwen_model_ids() {
+        let provider = bedrock_mantle();
+
+        assert_eq!(
+            provider.resolve_model_id("qwen.qwen3-coder-30b-a3b-v1:0"),
+            "qwen.qwen3-coder-30b-a3b-instruct"
+        );
+        assert_eq!(
+            provider.resolve_model_id("qwen.qwen3-coder-480b-a35b-v1:0"),
+            "qwen.qwen3-coder-480b-a35b-instruct"
+        );
     }
 }

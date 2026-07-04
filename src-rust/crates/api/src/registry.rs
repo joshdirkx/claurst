@@ -252,6 +252,22 @@ pub fn provider_from_config(
                 .unwrap_or_else(|| "us-east-1".to_string());
             BedrockProvider::from_env_with_region(region).map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         }
+        "bedrock-mantle" => {
+            let region = provider_cfg
+                .and_then(|cfg| cfg.region.as_deref())
+                .map(str::to_owned)
+                .or_else(|| std::env::var("AWS_REGION").ok())
+                .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let mut provider = providers::openai_compat_providers::bedrock_mantle_with_region(region);
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
         "github-copilot" => {
             api_key.map(|key| Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>)
         }
@@ -580,6 +596,13 @@ impl ProviderRegistry {
         }
         if std::env::var("DASHSCOPE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::qwen()));
+        }
+        if std::env::var("BEDROCK_MANTLE_API_KEY")
+            .or_else(|_| std::env::var("AWS_BEARER_TOKEN_BEDROCK"))
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            self.register(Arc::new(p::bedrock_mantle()));
         }
         if std::env::var("MISTRAL_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::mistral()));

@@ -76,6 +76,10 @@ pub struct ProviderQuirks {
     /// the default we request (e.g. DeepSeek Chat caps at 8 192).
     pub max_tokens_cap: Option<u32>,
 
+    /// Provider-local model ID aliases.  The first element is the Claurst/user
+    /// model ID, the second is the ID sent to the upstream provider.
+    pub model_aliases: Vec<(String, String)>,
+
     /// Set to `true` for providers that never require an API key (e.g.
     /// Ollama, LM Studio, llama.cpp).  When `true`, `health_check()` will
     /// always attempt a live network probe regardless of whether the base URL
@@ -390,6 +394,14 @@ impl OpenAiCompatProvider {
         request.temperature.or(self.quirks.default_temperature)
     }
 
+    pub(crate) fn resolve_model_id<'a>(&'a self, model: &'a str) -> &'a str {
+        self.quirks
+            .model_aliases
+            .iter()
+            .find_map(|(from, to)| (from == model).then_some(to.as_str()))
+            .unwrap_or(model)
+    }
+
     /// Attach the authorization header if an API key is configured.
     fn apply_auth(
         &self,
@@ -432,8 +444,9 @@ impl OpenAiCompatProvider {
             Some(cap) => request.max_tokens.min(cap),
             None => request.max_tokens,
         };
+        let model = self.resolve_model_id(&request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model,
             "max_tokens": max_tokens,
             "messages": messages,
             "stream": false,
@@ -510,8 +523,9 @@ impl OpenAiCompatProvider {
             Some(cap) => request.max_tokens.min(cap),
             None => request.max_tokens,
         };
+        let model = self.resolve_model_id(&request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model,
             "max_tokens": max_tokens,
             "messages": messages,
             "stream": true,

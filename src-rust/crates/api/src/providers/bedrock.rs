@@ -383,7 +383,10 @@ impl BedrockProvider {
 
     fn model_supports_tool_config(model: &str) -> bool {
         let model = model.to_ascii_lowercase();
-        model.contains("anthropic") || model.contains("claude") || model.contains("nova")
+        model.contains("anthropic")
+            || model.contains("claude")
+            || model.contains("nova")
+            || model.contains("qwen")
     }
 
     fn model_supports_reasoning_config(model: &str) -> bool {
@@ -1300,13 +1303,13 @@ mod tests {
     }
 
     #[test]
-    fn converse_body_omits_tool_config_for_qwen_models() {
+    fn converse_body_keeps_tool_config_for_qwen_models() {
         let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
         request.tools = vec![test_tool()];
 
         let body = BedrockProvider::build_converse_body(&request);
 
-        assert!(body.get("toolConfig").is_none());
+        assert!(body["toolConfig"]["tools"].is_array());
     }
 
     #[test]

@@ -34,6 +34,7 @@ impl ProviderId {
     pub const GOOGLE: &'static str = "google";
     pub const GOOGLE_VERTEX: &'static str = "google-vertex";
     pub const AMAZON_BEDROCK: &'static str = "amazon-bedrock";
+    pub const BEDROCK_MANTLE: &'static str = "bedrock-mantle";
     pub const AZURE: &'static str = "azure";
     pub const GITHUB_COPILOT: &'static str = "github-copilot";
     pub const MISTRAL: &'static str = "mistral";

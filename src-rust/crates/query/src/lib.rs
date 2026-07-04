@@ -971,7 +971,7 @@ pub async fn run_query_loop(
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
                     // Native (non-OpenAI-compat) providers
-                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
+                    "anthropic", "openai", "google", "azure", "amazon-bedrock", "bedrock-mantle",
                     "github-copilot", "codex", "openai-codex", "cohere", "minimax",
                     // Local / self-hosted
                     "ollama",

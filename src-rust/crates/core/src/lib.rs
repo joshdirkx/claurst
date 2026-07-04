@@ -676,6 +676,7 @@ pub mod config {
             "xai" => &["XAI_API_KEY"],
             "deepinfra" => &["DEEPINFRA_API_KEY"],
             "azure" => &["AZURE_API_KEY"],
+            "bedrock-mantle" => &["BEDROCK_MANTLE_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"],
             "gitlab" => &["GITLAB_TOKEN"],
             "huggingface" => &["HF_TOKEN"],
             "nvidia" => &["NVIDIA_API_KEY"],
@@ -715,6 +716,7 @@ pub mod config {
             "anthropic" => Some("ANTHROPIC_BASE_URL"),
             "openai" => Some("OPENAI_BASE_URL"),
             "minimax" => Some("MINIMAX_BASE_URL"),
+            "bedrock-mantle" => Some("BEDROCK_MANTLE_BASE_URL"),
             "ollama" => Some("OLLAMA_HOST"),
             "lmstudio" | "lm-studio" => Some("LM_STUDIO_HOST"),
             "llamacpp" | "llama-cpp" | "llama-server" => Some("LLAMA_CPP_HOST"),
@@ -1359,6 +1361,7 @@ pub mod config {
                 Some("custom-openai") => "default",
                 Some("azure") => "gpt-4o",
                 Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
+                Some("bedrock-mantle") => "qwen.qwen3-coder-30b-a3b-instruct",
                 Some("venice") => "llama-3.3-70b",
                 _ => crate::constants::DEFAULT_MODEL, // Anthropic default
             }
