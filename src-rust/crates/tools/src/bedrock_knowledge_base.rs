@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 
 pub struct BedrockKnowledgeBaseRetrieveTool;
 
+const MANAGED_KB_STANDARD_RETRIEVE_COST_USD: f64 = 0.001;
+
 #[derive(Debug, Deserialize)]
 struct BedrockKnowledgeBaseRetrieveInput {
     query: String,
@@ -192,6 +194,12 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
             }
         };
 
+        // The tool calls the standard managed Knowledge Base Retrieve API,
+        // which AWS prices per API call. Record it as direct service cost so
+        // the session meter includes retrieval without distorting token usage.
+        ctx.cost_tracker
+            .add_service_cost_usd(MANAGED_KB_STANDARD_RETRIEVE_COST_USD);
+
         let output = json!({
             "knowledge_base": {
                 "id": selection.id,
@@ -229,6 +237,7 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
             "knowledge_base": selection.label,
             "region": client.region(),
             "result_count": output["results"].as_array().map_or(0, Vec::len),
+            "estimated_cost_usd": MANAGED_KB_STANDARD_RETRIEVE_COST_USD,
         }))
     }
 }

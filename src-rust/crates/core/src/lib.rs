@@ -3623,6 +3623,7 @@ pub mod cost {
         output_tokens: AtomicU64,
         cache_creation_tokens: AtomicU64,
         cache_read_tokens: AtomicU64,
+        service_cost_microusd: AtomicU64,
         pricing: parking_lot::RwLock<ModelPricing>,
     }
 
@@ -3665,18 +3666,31 @@ pub mod cost {
                 .fetch_add(cache_read, Ordering::Relaxed);
         }
 
+        pub fn add_service_cost_usd(&self, cost_usd: f64) {
+            if !cost_usd.is_finite() || cost_usd <= 0.0 {
+                return;
+            }
+
+            let microusd = (cost_usd * 1_000_000.0).round() as u64;
+            self.service_cost_microusd
+                .fetch_add(microusd, Ordering::Relaxed);
+        }
+
         pub fn total_cost_usd(&self) -> f64 {
             let pricing = *self.pricing.read();
             let input = self.input_tokens.load(Ordering::Relaxed) as f64;
             let output = self.output_tokens.load(Ordering::Relaxed) as f64;
             let cache_creation = self.cache_creation_tokens.load(Ordering::Relaxed) as f64;
             let cache_read = self.cache_read_tokens.load(Ordering::Relaxed) as f64;
+            let service_cost =
+                self.service_cost_microusd.load(Ordering::Relaxed) as f64 / 1_000_000.0;
 
             (input * pricing.input_per_mtk
                 + output * pricing.output_per_mtk
                 + cache_creation * pricing.cache_creation_per_mtk
                 + cache_read * pricing.cache_read_per_mtk)
                 / 1_000_000.0
+                + service_cost
         }
 
         pub fn total_tokens(&self) -> u64 {
@@ -3700,6 +3714,10 @@ pub mod cost {
 
         pub fn cache_read_tokens(&self) -> u64 {
             self.cache_read_tokens.load(Ordering::Relaxed)
+        }
+
+        pub fn service_cost_usd(&self) -> f64 {
+            self.service_cost_microusd.load(Ordering::Relaxed) as f64 / 1_000_000.0
         }
 
         /// Produce a human-readable summary string, e.g. for display in the TUI.
@@ -4922,7 +4940,20 @@ mod tests {
         let tracker = CostTracker::new();
         assert_eq!(tracker.input_tokens(), 0);
         assert_eq!(tracker.output_tokens(), 0);
+        assert_eq!(tracker.service_cost_usd(), 0.0);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_cost_tracker_includes_service_cost() {
+        let tracker = CostTracker::with_model("deepseek-v4-flash-free");
+        tracker.add_service_cost_usd(0.001);
+        tracker.add_service_cost_usd(0.0025);
+
+        assert_eq!(tracker.input_tokens(), 0);
+        assert_eq!(tracker.output_tokens(), 0);
+        assert_eq!(tracker.service_cost_usd(), 0.0035);
+        assert_eq!(tracker.total_cost_usd(), 0.0035);
     }
 
     #[test]
