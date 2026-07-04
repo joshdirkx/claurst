@@ -1190,14 +1190,47 @@ fn push_blank_item(items: &mut Vec<RenderedLineItem>) {
 }
 
 fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width: u16) -> Vec<Line<'static>> {
-    let mut header_spans = vec![Span::raw("  ▼ ")];
-    header_spans.extend(shimmer_spans("Thinking", frame_count));
+    let thinking_accent = Color::Rgb(85, 190, 205);
+    let thinking_bg = Color::Rgb(15, 29, 34);
+    let mut header_spans = vec![
+        Span::styled("  │ ", Style::default().fg(thinking_accent).bg(thinking_bg)),
+        Span::styled(
+            " THINKING ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(thinking_accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ▼ ",
+            Style::default()
+                .fg(thinking_accent)
+                .bg(thinking_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut shimmer = shimmer_spans("Thinking", frame_count);
+    for span in &mut shimmer {
+        span.style = span.style.bg(thinking_bg);
+    }
+    header_spans.extend(shimmer);
     if let Some(heading) = turn.reasoning_heading() {
         header_spans.push(Span::styled(
-            format!(": {}", heading),
+            format!("  {}", heading),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Rgb(176, 204, 210))
+                .bg(thinking_bg)
                 .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let used = header_spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    if used < width as usize {
+        header_spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().bg(thinking_bg),
         ));
     }
     let mut lines = vec![Line::from(header_spans)];

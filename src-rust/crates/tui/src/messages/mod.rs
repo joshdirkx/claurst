@@ -66,7 +66,10 @@ const TRANSCRIPT_USER_BG: Color = Color::Rgb(23, 23, 31);
 const TRANSCRIPT_CHIP_BG: Color = Color::Rgb(31, 31, 41);
 const TRANSCRIPT_TEXT: Color = Color::Rgb(236, 236, 241);
 const TRANSCRIPT_MUTED: Color = Color::Rgb(139, 139, 153);
-const TRANSCRIPT_SUBTLE: Color = Color::Rgb(112, 112, 126);
+const THINKING_ACCENT: Color = Color::Rgb(85, 190, 205);
+const THINKING_BG: Color = Color::Rgb(15, 29, 34);
+const THINKING_TEXT: Color = Color::Rgb(176, 204, 210);
+const THINKING_MUTED: Color = Color::Rgb(113, 151, 160);
 
 const TOOL_RESULT_MAX_LINES: usize = 30;
 
@@ -540,29 +543,36 @@ pub fn render_transcript_reasoning_block(
     let mut lines = Vec::new();
     let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
     let chevron = if expanded { "▼" } else { "▶" };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {} Thinking: ", chevron),
-            Style::default()
-                .fg(TRANSCRIPT_MUTED)
-                .add_modifier(Modifier::ITALIC),
-        ),
-        Span::styled(
-            heading,
-            Style::default()
-                .fg(TRANSCRIPT_SUBTLE)
-                .add_modifier(Modifier::ITALIC),
-        ),
-    ]));
+    lines.push(apply_thinking_block_style(
+        Line::from(vec![
+            Span::styled(
+                " THINKING ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(THINKING_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", chevron),
+                Style::default()
+                    .fg(THINKING_ACCENT)
+                    .bg(THINKING_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                heading,
+                Style::default()
+                    .fg(THINKING_TEXT)
+                    .bg(THINKING_BG)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]),
+        width,
+    ));
 
     if expanded {
         let rendered = render_markdown(text, width.saturating_sub(6));
-        lines.extend(indent_lines(
-            rendered,
-            "    ",
-            Style::default(),
-            TRANSCRIPT_MUTED,
-        ));
+        lines.extend(render_thinking_lines_with_rail(rendered, width));
     }
 
     lines
@@ -571,7 +581,41 @@ pub fn render_transcript_reasoning_block(
 /// Render the thinking content body (without header) for live streaming display.
 pub fn render_thinking_live_content(text: &str, width: u16) -> Vec<Line<'static>> {
     let rendered = render_markdown(text, width.saturating_sub(6));
-    indent_lines(rendered, "    ", Style::default(), TRANSCRIPT_MUTED)
+    render_thinking_lines_with_rail(rendered, width)
+}
+
+fn render_thinking_lines_with_rail(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| apply_thinking_block_style(line, width))
+        .collect()
+}
+
+fn apply_thinking_block_style(mut line: Line<'static>, width: u16) -> Line<'static> {
+    // Thinking is semantically separate from final response text. The rail,
+    // badge, and filled background make that boundary visible for Bedrock open
+    // models that expose reasoning as a normalized Claurst Thinking block.
+    for span in &mut line.spans {
+        if span.style.fg.is_none() {
+            span.style = span.style.fg(THINKING_TEXT);
+        }
+        span.style = span.style.bg(THINKING_BG);
+    }
+
+    let mut spans = vec![
+        Span::styled("  │ ", Style::default().fg(THINKING_ACCENT).bg(THINKING_BG)),
+    ];
+    spans.extend(line.spans);
+
+    let used = spans.iter().map(|span| span.content.width()).sum::<usize>();
+    if used < width as usize {
+        spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().fg(THINKING_MUTED).bg(THINKING_BG),
+        ));
+    }
+
+    Line::from(spans)
 }
 
 /// Returns lines for each content block with an optional thinking hash tag.
@@ -2059,6 +2103,30 @@ mod tests {
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+    }
+
+    #[test]
+    fn reasoning_block_has_explicit_thinking_marker() {
+        let collapsed_lines = render_transcript_reasoning_block("inspect files", false, 80);
+        let collapsed = collapsed_lines
+            .iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(collapsed.contains("THINKING"));
+        assert_eq!(collapsed_lines.len(), 1);
+
+        let expanded_lines = render_transcript_reasoning_block("inspect files", true, 80);
+        let expanded = expanded_lines
+            .iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(expanded.contains("THINKING"));
+        assert!(expanded.contains("inspect files"));
+        assert!(expanded_lines.len() > collapsed_lines.len());
     }
 
     #[test]
