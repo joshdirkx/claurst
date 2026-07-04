@@ -1852,6 +1852,21 @@ async fn run_interactive(
         }
     }
 
+    if let Some(runtime) =
+        claurst_tools::bedrock_knowledge_base::resolve_bedrock_knowledge_base_runtime(
+            &live_config,
+            Some(&base_query_config.provider_options),
+        )
+    {
+        app.status_message = Some(if runtime.is_configured() {
+            claurst_tools::bedrock_knowledge_base::describe_bedrock_knowledge_base_runtime(
+                &runtime,
+            )
+        } else {
+            "Bedrock KB not configured; regenerate project settings.".to_string()
+        });
+    }
+
     // Version-upgrade notice: record the current version for future comparisons.
     // (Actual upgrade notice UI is handled by the release-notes slash command.)
     {

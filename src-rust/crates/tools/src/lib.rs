@@ -521,6 +521,20 @@ pub trait Tool: Send + Sync {
             input_schema: self.input_schema(),
         }
     }
+
+    /// Produce a `ToolDefinition` with access to the active runtime context.
+    ///
+    /// Most tools are static, but provider-native tools can use this hook to
+    /// advertise configured session capabilities directly to models that need
+    /// more concrete affordances than a generic schema can provide.
+    fn to_definition_with_context(
+        &self,
+        ctx: &ToolContext,
+        provider_options: Option<&std::collections::HashMap<String, Value>>,
+    ) -> ToolDefinition {
+        let _ = (ctx, provider_options);
+        self.to_definition()
+    }
 }
 
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).

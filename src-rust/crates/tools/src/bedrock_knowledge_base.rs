@@ -1,7 +1,9 @@
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+use claurst_core::types::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 pub struct BedrockKnowledgeBaseRetrieveTool;
 
@@ -33,18 +35,63 @@ struct BedrockKnowledgeBaseRetrieveInput {
 }
 
 #[derive(Debug, Clone)]
-struct KnowledgeBaseToolConfig {
-    name: Option<String>,
-    id: String,
-    description: Option<String>,
-    region: Option<String>,
-    number_of_results: Option<u32>,
-    retrieval_configuration: Option<Value>,
+pub struct BedrockKnowledgeBaseConfig {
+    pub name: Option<String>,
+    pub id: String,
+    pub description: Option<String>,
+    pub region: Option<String>,
+    pub number_of_results: Option<u32>,
+    pub retrieval_configuration: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BedrockKnowledgeBaseRuntimeConfig {
+    pub configured: Vec<BedrockKnowledgeBaseConfig>,
+    pub default_knowledge_base: Option<String>,
+    pub provider_region: String,
+}
+
+impl BedrockKnowledgeBaseRuntimeConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.configured.is_empty() || self.default_knowledge_base.is_some()
+    }
+
+    pub fn labels(&self) -> Vec<String> {
+        let mut labels = self
+            .configured
+            .iter()
+            .map(|kb| match &kb.name {
+                Some(name) => format!("{} ({})", name, kb.id),
+                None => kb.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            if let Some(default) = &self.default_knowledge_base {
+                labels.push(default.clone());
+            }
+        }
+        labels
+    }
+
+    pub fn default_label(&self) -> Option<String> {
+        self.default_knowledge_base.clone().or_else(|| {
+            if self.configured.len() == 1 {
+                Some(
+                    self.configured[0]
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| self.configured[0].id.clone()),
+                )
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
 struct KnowledgeBaseSelection {
-    configured: Option<KnowledgeBaseToolConfig>,
+    configured: Option<BedrockKnowledgeBaseConfig>,
     id: String,
     label: String,
 }
@@ -100,6 +147,54 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
         })
     }
 
+    fn to_definition_with_context(
+        &self,
+        ctx: &ToolContext,
+        provider_options: Option<&HashMap<String, Value>>,
+    ) -> ToolDefinition {
+        let mut definition = self.to_definition();
+        let Some(runtime) = resolve_bedrock_knowledge_base_runtime(&ctx.config, provider_options) else {
+            return definition;
+        };
+        if !runtime.is_configured() {
+            return definition;
+        }
+
+        let labels = runtime.labels().join(", ");
+        let default_text = runtime.default_label().unwrap_or_else(|| "none".to_string());
+        definition.description = format!(
+            "{} Configured for this Bedrock session: aliases or ids [{}], default [{}], region [{}]. \
+Use this tool directly for Amazon Bedrock Knowledge Base retrieval; do not look for an MCP server. \
+Omit knowledge_base when the default is appropriate.",
+            self.description(),
+            labels,
+            default_text,
+            runtime.provider_region,
+        );
+
+        if let Some(properties) = definition
+            .input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(knowledge_base) = properties
+                .get_mut("knowledge_base")
+                .and_then(Value::as_object_mut)
+            {
+                knowledge_base.insert(
+                    "description".to_string(),
+                    json!(format!(
+                        "Optional configured Knowledge Base name/alias, Bedrock knowledge base id, or ARN. Configured aliases or ids: {}. Default: {}. Omit this field when the default is appropriate.",
+                        labels,
+                        default_text
+                    )),
+                );
+            }
+        }
+
+        definition
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: BedrockKnowledgeBaseRetrieveInput = match serde_json::from_value(input) {
             Ok(params) => params,
@@ -109,17 +204,18 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
             return ToolResult::error("query must not be empty");
         }
 
-        let provider_options = ctx
-            .config
-            .provider_configs
-            .get("amazon-bedrock")
-            .map(|provider| &provider.options);
-        let configured_kbs = parse_configured_knowledge_bases(provider_options);
-        let default_kb = default_knowledge_base(provider_options);
+        let runtime = resolve_bedrock_knowledge_base_runtime(&ctx.config, None);
+        let configured_kbs = runtime
+            .as_ref()
+            .map(|runtime| runtime.configured.as_slice())
+            .unwrap_or(&[]);
+        let default_kb = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.default_label());
         let selection = match select_knowledge_base(
             params.knowledge_base.as_deref(),
             default_kb.as_deref(),
-            &configured_kbs,
+            configured_kbs,
         ) {
             Ok(selection) => selection,
             Err(message) => return ToolResult::error(message),
@@ -138,10 +234,9 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
             .as_ref()
             .and_then(|kb| kb.region.clone())
             .or_else(|| {
-                ctx.config
-                    .provider_configs
-                    .get("amazon-bedrock")
-                    .and_then(|provider| provider.region.clone())
+                runtime
+                    .as_ref()
+                    .map(|runtime| runtime.provider_region.clone())
             })
             .or_else(|| std::env::var("AWS_REGION").ok())
             .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
@@ -174,7 +269,7 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
                 return ToolResult::error(
                     "Bedrock Knowledge Base retrieval requires AWS_ACCESS_KEY_ID and \
                      AWS_SECRET_ACCESS_KEY temporary credentials, or AWS_BEARER_TOKEN_BEDROCK. \
-                     Launch Claurst through the Melange Bedrock role wrapper or export AWS credentials.",
+                     Launch Claurst with AWS credentials or an AWS role wrapper.",
                 );
             }
         };
@@ -242,9 +337,73 @@ impl Tool for BedrockKnowledgeBaseRetrieveTool {
     }
 }
 
+pub fn resolve_bedrock_knowledge_base_runtime(
+    config: &claurst_core::config::Config,
+    provider_options_override: Option<&HashMap<String, Value>>,
+) -> Option<BedrockKnowledgeBaseRuntimeConfig> {
+    if !matches!(
+        config.provider.as_deref(),
+        Some("amazon-bedrock" | "bedrock-mantle")
+    ) {
+        return None;
+    }
+
+    let active_provider_options = provider_options_override.or_else(|| {
+        config
+            .provider
+            .as_deref()
+            .and_then(|provider| config.provider_configs.get(provider))
+            .map(|provider| &provider.options)
+    });
+    let amazon_bedrock_options = config
+        .provider_configs
+        .get("amazon-bedrock")
+        .map(|provider| &provider.options);
+
+    let mut configured = parse_configured_knowledge_bases(active_provider_options);
+    if configured.is_empty() {
+        configured = parse_configured_knowledge_bases(amazon_bedrock_options);
+    }
+
+    let default_knowledge_base = default_knowledge_base(active_provider_options)
+        .or_else(|| default_knowledge_base(amazon_bedrock_options));
+
+    let provider_region = config
+        .provider
+        .as_deref()
+        .and_then(|provider| config.provider_configs.get(provider))
+        .and_then(|provider| provider.region.clone())
+        .or_else(|| {
+            config
+                .provider_configs
+                .get("amazon-bedrock")
+                .and_then(|provider| provider.region.clone())
+        })
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    Some(BedrockKnowledgeBaseRuntimeConfig {
+        configured,
+        default_knowledge_base,
+        provider_region,
+    })
+}
+
+pub fn describe_bedrock_knowledge_base_runtime(
+    runtime: &BedrockKnowledgeBaseRuntimeConfig,
+) -> String {
+    let labels = runtime.labels().join(", ");
+    let default_text = runtime.default_label().unwrap_or_else(|| "none".to_string());
+    format!(
+        "Bedrock KB configured: {} (default: {}, region: {})",
+        labels, default_text, runtime.provider_region
+    )
+}
+
 fn parse_configured_knowledge_bases(
-    provider_options: Option<&std::collections::HashMap<String, Value>>,
-) -> Vec<KnowledgeBaseToolConfig> {
+    provider_options: Option<&HashMap<String, Value>>,
+) -> Vec<BedrockKnowledgeBaseConfig> {
     let Some(options) = provider_options else {
         return Vec::new();
     };
@@ -265,10 +424,10 @@ fn parse_configured_knowledge_bases(
     configured
 }
 
-fn parse_knowledge_base_config(value: &Value) -> Option<KnowledgeBaseToolConfig> {
+fn parse_knowledge_base_config(value: &Value) -> Option<BedrockKnowledgeBaseConfig> {
     let obj = value.as_object()?;
     let id = first_string(obj, &["id", "knowledgeBaseId", "knowledge_base_id"])?;
-    Some(KnowledgeBaseToolConfig {
+    Some(BedrockKnowledgeBaseConfig {
         name: first_string(obj, &["name", "alias"]),
         id,
         description: first_string(obj, &["description"]),
@@ -295,7 +454,7 @@ fn first_u32(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u32>
 }
 
 fn default_knowledge_base(
-    provider_options: Option<&std::collections::HashMap<String, Value>>,
+    provider_options: Option<&HashMap<String, Value>>,
 ) -> Option<String> {
     let options = provider_options?;
     options
@@ -309,7 +468,7 @@ fn default_knowledge_base(
 fn select_knowledge_base(
     requested: Option<&str>,
     default_kb: Option<&str>,
-    configured: &[KnowledgeBaseToolConfig],
+    configured: &[BedrockKnowledgeBaseConfig],
 ) -> Result<KnowledgeBaseSelection, String> {
     let requested = requested
         .filter(|value| !value.trim().is_empty())
@@ -351,7 +510,7 @@ fn select_knowledge_base(
     }
 }
 
-fn kb_matches(config: &KnowledgeBaseToolConfig, requested: &str) -> bool {
+fn kb_matches(config: &BedrockKnowledgeBaseConfig, requested: &str) -> bool {
     config.id == requested || config.name.as_deref() == Some(requested)
 }
 
@@ -415,20 +574,82 @@ fn truncate_chunk_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claurst_core::config::{Config, PermissionMode, ProviderConfig};
+    use claurst_core::permissions::AutoPermissionHandler;
+    use std::path::PathBuf;
+    use std::sync::{
+        Arc,
+        atomic::AtomicUsize,
+    };
 
     fn provider_options() -> std::collections::HashMap<String, Value> {
-        std::collections::HashMap::from([(
-            "knowledgeBases".to_string(),
-            json!([
-                {
-                    "name": "melange",
-                    "id": "KB12345678",
-                    "description": "Melange project knowledge",
-                    "region": "us-west-2",
-                    "numberOfResults": 3
-                }
-            ]),
-        )])
+        std::collections::HashMap::from([
+            (
+                "defaultKnowledgeBase".to_string(),
+                json!("project-kb"),
+            ),
+            (
+                "knowledgeBases".to_string(),
+                json!([
+                    {
+                        "name": "project-kb",
+                        "id": "KB12345678",
+                        "description": "Project knowledge",
+                        "region": "us-west-2",
+                        "numberOfResults": 3
+                    }
+                ]),
+            ),
+        ])
+    }
+
+    fn config_with_provider(provider: &str) -> Config {
+        let mut config = Config {
+            provider: Some(provider.to_string()),
+            ..Config::default()
+        };
+        config.provider_configs.insert(
+            "amazon-bedrock".to_string(),
+            ProviderConfig {
+                region: Some("us-west-2".to_string()),
+                options: provider_options(),
+                ..ProviderConfig::default()
+            },
+        );
+        if provider == "bedrock-mantle" {
+            config.provider_configs.insert(
+                "bedrock-mantle".to_string(),
+                ProviderConfig {
+                    region: Some("us-west-2".to_string()),
+                    ..ProviderConfig::default()
+                },
+            );
+        }
+        config
+    }
+
+    fn test_context(config: Config) -> ToolContext {
+        ToolContext {
+            working_dir: PathBuf::from("/workspace"),
+            permission_mode: PermissionMode::BypassPermissions,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::BypassPermissions,
+            }),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+        }
     }
 
     #[test]
@@ -437,9 +658,57 @@ mod tests {
         let configured = parse_configured_knowledge_bases(Some(&options));
 
         assert_eq!(configured.len(), 1);
-        assert_eq!(configured[0].name.as_deref(), Some("melange"));
+        assert_eq!(configured[0].name.as_deref(), Some("project-kb"));
         assert_eq!(configured[0].id, "KB12345678");
         assert_eq!(configured[0].number_of_results, Some(3));
+    }
+
+    #[test]
+    fn runtime_resolves_amazon_bedrock_knowledge_base() {
+        let config = config_with_provider("amazon-bedrock");
+        let runtime = resolve_bedrock_knowledge_base_runtime(&config, None)
+            .expect("amazon-bedrock runtime should resolve");
+
+        assert!(runtime.is_configured());
+        assert_eq!(runtime.default_label().as_deref(), Some("project-kb"));
+        assert_eq!(runtime.configured[0].id, "KB12345678");
+        assert_eq!(runtime.provider_region, "us-west-2");
+    }
+
+    #[test]
+    fn runtime_falls_back_to_amazon_bedrock_config_for_mantle() {
+        let config = config_with_provider("bedrock-mantle");
+        let runtime = resolve_bedrock_knowledge_base_runtime(&config, None)
+            .expect("bedrock-mantle runtime should resolve");
+
+        assert!(runtime.is_configured());
+        assert_eq!(runtime.default_label().as_deref(), Some("project-kb"));
+        assert_eq!(runtime.configured[0].id, "KB12345678");
+    }
+
+    #[test]
+    fn runtime_is_not_enabled_for_non_bedrock_providers() {
+        let config = Config {
+            provider: Some("openai".to_string()),
+            ..Config::default()
+        };
+
+        assert!(resolve_bedrock_knowledge_base_runtime(&config, None).is_none());
+    }
+
+    #[test]
+    fn tool_definition_advertises_configured_default_knowledge_base() {
+        let ctx = test_context(config_with_provider("amazon-bedrock"));
+        let definition = BedrockKnowledgeBaseRetrieveTool.to_definition_with_context(&ctx, None);
+
+        assert!(definition.description.contains("project-kb"));
+        assert!(definition.description.contains("KB12345678"));
+        assert!(definition.description.contains("do not look for an MCP server"));
+        assert!(definition.description.contains("Omit knowledge_base"));
+        assert!(definition
+            .input_schema
+            .to_string()
+            .contains("Default: project-kb"));
     }
 
     #[test]
@@ -449,7 +718,7 @@ mod tests {
         let selection = select_knowledge_base(None, None, &configured).expect("selection");
 
         assert_eq!(selection.id, "KB12345678");
-        assert_eq!(selection.label, "melange");
+        assert_eq!(selection.label, "project-kb");
     }
 
     #[test]
