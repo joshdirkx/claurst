@@ -193,10 +193,7 @@ impl BedrockProvider {
         let parsed = url::Url::parse(url_str).unwrap_or_else(|_| {
             url::Url::parse("https://bedrock-runtime.us-east-1.amazonaws.com/").unwrap()
         });
-        let canonical_uri = {
-            let p = parsed.path();
-            if p.is_empty() { "/".to_string() } else { p.to_string() }
-        };
+        let canonical_uri = sigv4_canonical_uri(parsed.path());
         let canonical_query = parsed.query().unwrap_or("").to_string();
 
         // Body hash.
@@ -677,6 +674,32 @@ struct BedrockAuth {
 
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn sigv4_canonical_uri(path: &str) -> String {
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        aws_uri_encode(path, false)
+    }
+}
+
+fn aws_uri_encode(value: &str, encode_slash: bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~' => encoded.push(byte as char),
+            b'/' if !encode_slash => encoded.push('/'),
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1210,14 @@ mod tests {
         assert!(auth.secret_access_key.is_none());
         assert!(auth.session_token.is_none());
         assert_eq!(auth.bearer_token.as_deref(), Some("bedrock-bearer-token"));
+    }
+
+    #[test]
+    fn sigv4_canonical_uri_reencodes_escaped_model_id_colon() {
+        assert_eq!(
+            sigv4_canonical_uri("/model/qwen.qwen3-coder-30b-a3b-v1%3A0/converse-stream"),
+            "/model/qwen.qwen3-coder-30b-a3b-v1%253A0/converse-stream"
+        );
     }
 
     #[test]
