@@ -297,16 +297,7 @@ impl BedrockProvider {
     // -----------------------------------------------------------------------
 
     fn build_converse_body(request: &ProviderRequest) -> Value {
-        let prompt_cache = if Self::model_supports_prompt_caching(&request.model) {
-            BedrockPromptCachingOptions::from_provider_options(&request.provider_options)
-        } else {
-            // `promptCaching` is a Claurst policy request, not a field Bedrock
-            // accepts directly. Only turn it into Converse `cachePoint` blocks
-            // for model families where Bedrock documents that support; open
-            // model adapters like Qwen reject cache points and should keep the
-            // turn working without requiring users to rewrite shared settings.
-            BedrockPromptCachingOptions::disabled()
-        };
+        let prompt_cache = Self::prompt_cache_for_request(request);
         let messages = Self::build_converse_messages(request, &prompt_cache);
         let mut body = json!({
             "messages": messages,
@@ -446,9 +437,33 @@ impl BedrockProvider {
         // Bedrock prompt caching is model-family specific. Claude supports
         // explicit cache points across tools/system/messages. Nova also has
         // Bedrock prompt-caching support, including automatic caching and
-        // explicit cache points. Qwen, DeepSeek, and Llama currently reject
-        // cache points through Converse, so leave the policy inert for them.
+        // explicit cache points.
         model.contains("anthropic") || model.contains("claude") || model.contains("nova")
+    }
+
+    fn model_is_open_family_prompt_cache_candidate(model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        model.contains("qwen") || model.contains("deepseek") || model.contains("llama")
+    }
+
+    fn prompt_cache_for_request(request: &ProviderRequest) -> BedrockPromptCachingOptions {
+        let options = BedrockPromptCachingOptions::from_provider_options(&request.provider_options);
+        if !options.is_enabled() {
+            return options;
+        }
+        if Self::model_supports_prompt_caching(&request.model) {
+            return options;
+        }
+        if Self::model_is_open_family_prompt_cache_candidate(&request.model)
+            && options.experimental_open_models
+        {
+            return options;
+        }
+
+        // `promptCaching` is a Claurst policy request, not a field Bedrock
+        // accepts directly. Keep unsupported model families working unless the
+        // project explicitly opts into probing them.
+        BedrockPromptCachingOptions::disabled()
     }
 
     fn message_content_to_converse(content: &MessageContent, role: &Role) -> Vec<Value> {
@@ -548,6 +563,26 @@ impl BedrockProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<reqwest::Response, ProviderError> {
+        match self.send_streaming_once(request).await {
+            Err(error)
+                if Self::prompt_cache_for_request(request).is_enabled()
+                    && Self::is_prompt_caching_unsupported_error(&error) =>
+            {
+                debug!(
+                    model = %request.model,
+                    "Bedrock rejected prompt caching; retrying request without cache points"
+                );
+                let fallback = Self::request_without_prompt_caching(request);
+                self.send_streaming_once(&fallback).await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_streaming_once(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
         let bedrock_model = self.model_id_with_prefix(&request.model);
         let url = self.endpoint_url(&bedrock_model);
 
@@ -588,6 +623,26 @@ impl BedrockProvider {
     }
 
     async fn send_non_streaming(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        match self.send_non_streaming_once(request).await {
+            Err(error)
+                if Self::prompt_cache_for_request(request).is_enabled()
+                    && Self::is_prompt_caching_unsupported_error(&error) =>
+            {
+                debug!(
+                    model = %request.model,
+                    "Bedrock rejected prompt caching; retrying request without cache points"
+                );
+                let fallback = Self::request_without_prompt_caching(request);
+                self.send_non_streaming_once(&fallback).await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_non_streaming_once(
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
@@ -645,6 +700,47 @@ impl BedrockProvider {
         })?;
 
         Self::parse_converse_response(&json_val, &self.id)
+    }
+
+    fn request_without_prompt_caching(request: &ProviderRequest) -> ProviderRequest {
+        let mut fallback = request.clone();
+        match fallback.provider_options.as_object_mut() {
+            Some(options) => {
+                options.insert("promptCaching".to_string(), json!(false));
+            }
+            None => {
+                fallback.provider_options = json!({ "promptCaching": false });
+            }
+        }
+        fallback
+    }
+
+    fn is_prompt_caching_unsupported_error(error: &ProviderError) -> bool {
+        let mut haystack = match error {
+            ProviderError::InvalidRequest { message, .. }
+            | ProviderError::Other { message, .. }
+            | ProviderError::ServerError { message, .. }
+            | ProviderError::AuthFailed { message, .. }
+            | ProviderError::QuotaExceeded { message, .. }
+            | ProviderError::ContextOverflow { message, .. }
+            | ProviderError::ContentFiltered { message, .. }
+            | ProviderError::StreamError { message, .. } => message.clone(),
+            ProviderError::RateLimited { .. } | ProviderError::ModelNotFound { .. } => {
+                String::new()
+            }
+        };
+        if let ProviderError::Other { body: Some(body), .. } = error {
+            haystack.push('\n');
+            haystack.push_str(body);
+        }
+        let haystack = haystack.to_ascii_lowercase();
+        haystack.contains("prompt caching")
+            && (haystack.contains("unsupported")
+                || haystack.contains("not supported")
+                || haystack.contains("not allow")
+                || haystack.contains("not allowed")
+                || haystack.contains("cachepoint")
+                || haystack.contains("cache point"))
     }
 
     fn parse_converse_response(
@@ -746,6 +842,7 @@ struct BedrockPromptCachingOptions {
     cache_tools: bool,
     cache_system: bool,
     cache_messages: bool,
+    experimental_open_models: bool,
     ttl: Option<String>,
 }
 
@@ -755,8 +852,13 @@ impl BedrockPromptCachingOptions {
             cache_tools: false,
             cache_system: false,
             cache_messages: false,
+            experimental_open_models: false,
             ttl: None,
         }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.cache_tools || self.cache_system || self.cache_messages
     }
 
     fn from_provider_options(provider_options: &Value) -> Self {
@@ -771,6 +873,7 @@ impl BedrockPromptCachingOptions {
             cache_tools: true,
             cache_system: true,
             cache_messages: false,
+            experimental_open_models: false,
             ttl: None,
         };
 
@@ -797,6 +900,12 @@ impl BedrockPromptCachingOptions {
         options.cache_messages = obj
             .get("messages")
             .or_else(|| obj.get("cacheMessages"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        options.experimental_open_models = obj
+            .get("experimentalOpenModels")
+            .or_else(|| obj.get("openModels"))
+            .or_else(|| obj.get("probeOpenModels"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         options.ttl = obj
@@ -1683,6 +1792,56 @@ mod tests {
         let content = body["messages"][0]["content"].as_array().expect("content array");
         assert!(content.iter().all(|block| block.get("cachePoint").is_none()));
         assert!(body.get("promptCaching").is_none());
+    }
+
+    #[test]
+    fn converse_body_adds_experimental_prompt_cache_points_for_open_models() {
+        for model in [
+            "qwen.qwen3-coder-30b-a3b-v1:0",
+            "deepseek.v3.2",
+            "us.meta.llama3-3-70b-instruct-v1:0",
+        ] {
+            let mut request = test_request(model);
+            request.system_prompt = Some(SystemPrompt::Text("You are Claurst.".to_string()));
+            request.provider_options = json!({
+                "promptCaching": {
+                    "tools": true,
+                    "system": true,
+                    "messages": true,
+                    "experimentalOpenModels": true
+                }
+            });
+
+            let body = BedrockProvider::build_converse_body(&request);
+
+            let system = body["system"].as_array().expect("system array");
+            assert!(
+                system.iter().any(|block| block.get("cachePoint").is_some()),
+                "{model} should receive experimental system cache points"
+            );
+            let content = body["messages"][0]["content"].as_array().expect("content array");
+            assert!(
+                content.iter().any(|block| block.get("cachePoint").is_some()),
+                "{model} should receive experimental message cache points"
+            );
+            assert!(body.get("promptCaching").is_none());
+        }
+    }
+
+    #[test]
+    fn prompt_cache_rejection_detection_matches_bedrock_error_text() {
+        let error = ProviderError::Other {
+            provider: ProviderId::new(ProviderId::AMAZON_BEDROCK),
+            message: "Invocation of prompt caching on unsupported model or request did not allow prompt caching".to_string(),
+            status: Some(400),
+            body: None,
+        };
+
+        assert!(BedrockProvider::is_prompt_caching_unsupported_error(&error));
+
+        let request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        let fallback = BedrockProvider::request_without_prompt_caching(&request);
+        assert_eq!(fallback.provider_options["promptCaching"], json!(false));
     }
 
     #[test]
