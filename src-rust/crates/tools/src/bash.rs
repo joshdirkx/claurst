@@ -467,22 +467,27 @@ impl Tool for BashTool {
             .unwrap_or("This will execute a shell command.")
             .to_string();
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
-            &reason,
-            std::path::PathBuf::from(&params.command),
-            false,
-        ) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Security classifier — unconditionally block Critical-risk commands.
-        if classify_bash_command(&params.command) == BashRiskLevel::Critical {
+        // Classify before asking permission so truly read-only inspection
+        // commands (for example `sed -n`, `find`, `rg`, `ls`) can use the same
+        // no-prompt path as native read tools, while in-place/editing variants
+        // remain executable Bash requests.
+        let risk_level = classify_bash_command(&params.command);
+        if risk_level == BashRiskLevel::Critical {
             return ToolResult::error(format!(
                 "Command blocked: classified as Critical risk by the bash security classifier.\n\
                  Refusing to execute: {}",
                 params.command
             ));
+        }
+        let is_read_only = risk_level == BashRiskLevel::Safe;
+
+        if let Err(e) = ctx.check_permission_for_path(
+            self.name(),
+            &reason,
+            std::path::PathBuf::from(&params.command),
+            is_read_only,
+        ) {
+            return ToolResult::error(e.to_string());
         }
 
         let timeout_ms = params.timeout.min(600_000);

@@ -1604,19 +1604,18 @@ pub async fn run_query_loop(
         // Append assistant message to conversation
         messages.push(assistant_msg.clone());
 
-        // If the provider returned an unknown stop reason but the assistant
-        // message contains tool_use blocks, treat it as tool_use so we don't
-        // silently end the turn (issue #149: agent stops after tool call for
-        // providers that emit non-standard finish reasons).
+        // Tool-use blocks are the authoritative signal that we must execute
+        // tools and continue, even when an OpenAI-compatible or Bedrock model
+        // reports `end_turn`/`stop`. Several non-Anthropic model families emit
+        // valid tool calls with a generic final stop reason, and trusting that
+        // stop reason causes the agent to read a file, append no tool result
+        // turn, and appear to stop before the edit step.
         let raw_stop = stop_reason.as_deref().unwrap_or("end_turn");
-        let stop = match raw_stop {
-            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => raw_stop,
-            _ if !assistant_msg.get_tool_use_blocks().is_empty() => {
-                warn!(stop_reason = raw_stop, "Unknown stop reason with tool_use blocks present; treating as tool_use");
-                "tool_use"
-            }
-            _ => raw_stop,
-        };
+        let has_tool_use_blocks = !assistant_msg.get_tool_use_blocks().is_empty();
+        let stop = normalize_stop_reason_for_tool_blocks(raw_stop, has_tool_use_blocks);
+        if has_tool_use_blocks && raw_stop != stop {
+            warn!(stop_reason = raw_stop, "Tool-use blocks present; treating stop reason as tool_use");
+        }
 
         // T1-3: Fire PostModelTurn hooks after the model samples a response.
         // Hooks can inject blocking errors or veto continuation entirely.
@@ -2153,6 +2152,17 @@ pub async fn run_query_loop(
     }
 }
 
+fn normalize_stop_reason_for_tool_blocks<'a>(
+    raw_stop: &'a str,
+    has_tool_use_blocks: bool,
+) -> &'a str {
+    if has_tool_use_blocks {
+        "tool_use"
+    } else {
+        raw_stop
+    }
+}
+
 /// Execute a single tool invocation.
 async fn execute_tool(
     name: &str,
@@ -2536,6 +2546,22 @@ mod tests {
             &blocks[1],
             ContentBlock::Text { text } if text == "answer second"
         ));
+    }
+
+    #[test]
+    fn tool_blocks_force_tool_use_stop_reason() {
+        assert_eq!(
+            normalize_stop_reason_for_tool_blocks("end_turn", true),
+            "tool_use"
+        );
+        assert_eq!(
+            normalize_stop_reason_for_tool_blocks("stop", true),
+            "tool_use"
+        );
+        assert_eq!(
+            normalize_stop_reason_for_tool_blocks("end_turn", false),
+            "end_turn"
+        );
     }
 
     // ---- build_system_prompt tests ------------------------------------------

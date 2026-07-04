@@ -96,6 +96,56 @@ fn is_fork_bomb(cmd: &str) -> bool {
         || normalised.contains(":(){:|:&}")
 }
 
+fn normalized_arg_tokens(args: &str) -> impl Iterator<Item = &str> {
+    args.split_whitespace()
+        .map(|token| token.trim_matches(|c| c == '\'' || c == '"'))
+}
+
+fn has_shell_control_operator(args: &str) -> bool {
+    args.contains('|')
+        || args.contains(';')
+        || args.contains("&&")
+        || args.contains("||")
+        || args.contains(" >")
+        || args.contains(">>")
+}
+
+fn is_sed_read_only(args: &str) -> bool {
+    if has_shell_control_operator(args) {
+        return false;
+    }
+
+    // `sed` is safe for normal printing/transforms to stdout. In-place editing
+    // is the important boundary: GNU/BSD forms include `-i`, `-i.bak`,
+    // `-Ei`, and `--in-place[=...]`.
+    !normalized_arg_tokens(args).any(|token| {
+        token == "-i"
+            || token.starts_with("-i")
+            || token == "--in-place"
+            || token.starts_with("--in-place=")
+            || (token.starts_with('-')
+                && !token.starts_with("--")
+                && token.len() > 2
+                && token[1..].contains('i'))
+    })
+}
+
+fn is_find_read_only(args: &str) -> bool {
+    if has_shell_control_operator(args) {
+        return false;
+    }
+
+    // `find` is read-only until it is asked to delete, write result files, or
+    // execute another command. Treat those action forms as normal execution so
+    // they still pass through the permission dialog/profile rules.
+    !normalized_arg_tokens(args).any(|token| {
+        matches!(
+            token,
+            "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls" | "-fprint" | "-fprintf"
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -275,9 +325,28 @@ pub fn classify_bash_command(command: &str) -> BashRiskLevel {
         }
     }
 
+    let (bin, args) = split_command(cmd);
+
+    // ── Safe command variants with write-capable flags ─────────────────────
+
+    if bin == "sed" {
+        return if is_sed_read_only(args) {
+            BashRiskLevel::Safe
+        } else {
+            BashRiskLevel::Low
+        };
+    }
+
+    if bin == "find" {
+        return if is_find_read_only(args) {
+            BashRiskLevel::Safe
+        } else {
+            BashRiskLevel::Low
+        };
+    }
+
     // ── Low-risk: common dev tools ─────────────────────────────────────────
 
-    let (bin, args) = split_command(cmd);
     let low_cmds = [
         "git", "npm", "npx", "yarn", "pnpm",
         "cargo", "rustup", "rustc",
@@ -397,6 +466,7 @@ mod tests {
         assert_eq!(classify_bash_command("grep foo bar.txt"), BashRiskLevel::Safe);
         assert_eq!(classify_bash_command("echo hello"), BashRiskLevel::Safe);
         assert_eq!(classify_bash_command("find . -name '*.rs'"), BashRiskLevel::Safe);
+        assert_eq!(classify_bash_command("sed -n '1,120p' src/lib.rs"), BashRiskLevel::Safe);
         assert_eq!(classify_bash_command("git status"), BashRiskLevel::Safe);
         assert_eq!(classify_bash_command("git log --oneline"), BashRiskLevel::Safe);
     }
@@ -407,6 +477,11 @@ mod tests {
         assert_eq!(classify_bash_command("cargo build"), BashRiskLevel::Low);
         assert_eq!(classify_bash_command("npm install"), BashRiskLevel::Low);
         assert_eq!(classify_bash_command("pip install requests"), BashRiskLevel::Low);
+        assert_eq!(classify_bash_command("sed -i 's/a/b/' src/lib.rs"), BashRiskLevel::Low);
+        assert_eq!(classify_bash_command("sed -Ei 's/a/b/' src/lib.rs"), BashRiskLevel::Low);
+        assert_eq!(classify_bash_command("find . -delete"), BashRiskLevel::Low);
+        assert_eq!(classify_bash_command("find . -exec rm {} \\;"), BashRiskLevel::Low);
+        assert_eq!(classify_bash_command("find . | xargs rm"), BashRiskLevel::Low);
     }
 
     #[test]

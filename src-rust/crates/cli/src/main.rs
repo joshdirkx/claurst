@@ -2974,6 +2974,7 @@ async fn run_interactive(
                                 &pending.request.tool_name,
                                 &pending.request.description,
                                 pending.request.path.as_deref(),
+                                pending.request.is_read_only,
                                 pending.request.working_dir.as_deref(),
                                 &pending.request.allowed_roots,
                             )

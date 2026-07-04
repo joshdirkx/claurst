@@ -537,22 +537,26 @@ impl Tool for PtyBashTool {
             .unwrap_or("This will execute a shell command.")
             .to_string();
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
-            &reason,
-            std::path::PathBuf::from(&params.command),
-            false,
-        ) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Security classifier — block Critical-risk commands unconditionally.
-        if classify_bash_command(&params.command) == BashRiskLevel::Critical {
+        // Classify before asking permission so read-only shell inspection can
+        // flow like native Read/Grep/Glob tools, while write-capable variants
+        // such as `sed -i` and `find -exec` still require Bash permission.
+        let risk_level = classify_bash_command(&params.command);
+        if risk_level == BashRiskLevel::Critical {
             return ToolResult::error(format!(
                 "Command blocked: classified as Critical risk by the bash security classifier.\n\
                  Refusing to execute: {}",
                 params.command
             ));
+        }
+        let is_read_only = risk_level == BashRiskLevel::Safe;
+
+        if let Err(e) = ctx.check_permission_for_path(
+            self.name(),
+            &reason,
+            std::path::PathBuf::from(&params.command),
+            is_read_only,
+        ) {
+            return ToolResult::error(e.to_string());
         }
 
         let timeout_ms = params.timeout.min(600_000);

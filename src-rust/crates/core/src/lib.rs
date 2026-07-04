@@ -2519,6 +2519,7 @@ pub mod permissions {
             tool_name: &str,
             description: &str,
             path: Option<&str>,
+            is_read_only: bool,
             working_dir: Option<&std::path::Path>,
             allowed_roots: &[std::path::PathBuf],
         ) -> PermissionDecision {
@@ -2561,19 +2562,28 @@ pub mod permissions {
                 return PermissionDecision::Allow;
             }
 
-            let level = match PermissionLevel::for_tool(tool_name) {
+            let level = if is_read_only {
+                // Some execute-class tools have invocation-specific read-only
+                // modes. Bash inspection commands such as `sed -n`, `find`,
+                // and `rg` should follow the same profile path as native read
+                // tools without changing the default risk of Bash as a tool.
                 PermissionLevel::Read
-                    if !matches!(
-                        tool_name,
-                        "Read" | "Glob" | "Grep" | "ListMcpResources" | "ReadMcpResource" | "LSP" | "Skill"
-                    ) => PermissionLevel::Execute,
-                other => other,
+            } else {
+                match PermissionLevel::for_tool(tool_name) {
+                    PermissionLevel::Read
+                        if !matches!(
+                            tool_name,
+                            "Read" | "Glob" | "Grep" | "ListMcpResources" | "ReadMcpResource" | "LSP" | "Skill"
+                        ) => PermissionLevel::Execute,
+                    other => other,
+                }
             };
             let read_in_workspace = path.is_some_and(|target| {
                 is_path_within_allowed_roots(target, working_dir, allowed_roots)
             });
             let should_ask_read = match tool_name {
                 "ListMcpResources" | "ReadMcpResource" => true,
+                "Bash" | "PowerShell" if is_read_only => false,
                 _ if matches!(level, PermissionLevel::Read) && path.is_some() => !read_in_workspace,
                 _ => false,
             };
@@ -2863,6 +2873,7 @@ pub mod permissions {
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
+                    request.is_read_only,
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                 );
@@ -2900,6 +2911,7 @@ pub mod permissions {
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
+                    request.is_read_only,
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                 );
@@ -2949,7 +2961,7 @@ pub mod permissions {
         fn bypass_always_allows() {
             let m = mgr(PermissionMode::BypassPermissions);
             assert_eq!(
-                m.evaluate("Bash", "rm -rf /", None, None, &[]),
+                m.evaluate("Bash", "rm -rf /", None, false, None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -2963,6 +2975,7 @@ pub mod permissions {
                     "Read",
                     "read file",
                     Some("/workspace/src/lib.rs"),
+                    true,
                     Some(cwd),
                     &[],
                 ),
@@ -2978,6 +2991,7 @@ pub mod permissions {
                 "Read",
                 "read file",
                 Some("/tmp/outside.txt"),
+                true,
                 Some(cwd),
                 &[],
             ) {
@@ -2996,6 +3010,7 @@ pub mod permissions {
                     "Read",
                     "read file",
                     Some("/external/notes.txt"),
+                    true,
                     Some(cwd),
                     &extra,
                 ),
@@ -3006,10 +3021,26 @@ pub mod permissions {
         #[test]
         fn default_bash_asks() {
             let m = mgr(PermissionMode::Default);
-            match m.evaluate("Bash", "echo hello", None, None, &[]) {
+            match m.evaluate("Bash", "echo hello", None, false, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
+        }
+
+        #[test]
+        fn default_read_only_bash_allows_without_prompt() {
+            let m = mgr(PermissionMode::Default);
+            assert_eq!(
+                m.evaluate(
+                    "Bash",
+                    "inspect source",
+                    Some("sed -n '1,120p' src/lib.rs"),
+                    true,
+                    None,
+                    &[],
+                ),
+                PermissionDecision::Allow
+            );
         }
 
         #[test]
@@ -3017,7 +3048,7 @@ pub mod permissions {
             let mut m = mgr(PermissionMode::Default);
             m.add_session_allow("Bash");
             assert_eq!(
-                m.evaluate("Bash", "echo hi", None, None, &[]),
+                m.evaluate("Bash", "echo hi", None, false, None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -3032,14 +3063,14 @@ pub mod permissions {
                 action: PermissionAction::Deny,
                 scope: PermissionScope::Session,
             });
-            assert_eq!(m.evaluate("Bash", "echo hi", None, None, &[]), PermissionDecision::Deny);
+            assert_eq!(m.evaluate("Bash", "echo hi", None, false, None, &[]), PermissionDecision::Deny);
         }
 
         #[test]
         fn plan_denies_writes() {
             let m = mgr(PermissionMode::Plan);
             assert_eq!(
-                m.evaluate("Write", "write file", Some("/tmp/foo"), None, &[]),
+                m.evaluate("Write", "write file", Some("/tmp/foo"), false, None, &[]),
                 PermissionDecision::Deny
             );
         }
@@ -3048,7 +3079,7 @@ pub mod permissions {
         fn plan_allows_reads() {
             let m = mgr(PermissionMode::Plan);
             assert_eq!(
-                m.evaluate("Read", "read file", Some("/tmp/foo"), None, &[]),
+                m.evaluate("Read", "read file", Some("/tmp/foo"), true, None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -3057,10 +3088,10 @@ pub mod permissions {
         fn accept_edits_only_allows_edit() {
             let m = mgr(PermissionMode::AcceptEdits);
             assert_eq!(
-                m.evaluate("Edit", "edit file", Some("/workspace/src/lib.rs"), None, &[]),
+                m.evaluate("Edit", "edit file", Some("/workspace/src/lib.rs"), false, None, &[]),
                 PermissionDecision::Allow
             );
-            match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
+            match m.evaluate("Bash", "rm -rf /tmp", None, false, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
@@ -3076,7 +3107,7 @@ pub mod permissions {
                 scope: PermissionScope::Session,
             });
             assert_eq!(
-                m.evaluate("Write", "write", Some("/tmp/foo/bar.txt"), None, &[]),
+                m.evaluate("Write", "write", Some("/tmp/foo/bar.txt"), false, None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -3090,7 +3121,7 @@ pub mod permissions {
                 action: PermissionAction::Allow,
                 scope: PermissionScope::Session,
             });
-            match m.evaluate("Write", "write", Some("/etc/hosts"), None, &[]) {
+            match m.evaluate("Write", "write", Some("/etc/hosts"), false, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
