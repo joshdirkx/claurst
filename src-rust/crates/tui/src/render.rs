@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus, ToolUseBlock};
 use crate::rustle::rustle_lines;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -52,7 +52,7 @@ use crate::theme_screen::render_theme_screen;
 use crate::transcript_turn::{build_transcript_turns, TranscriptTurn};
 use crate::virtual_list::{VirtualItem, VirtualList};
 use claurst_core::constants::APP_VERSION;
-use claurst_core::types::Role;
+use claurst_core::types::{ContentBlock, Message, Role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -730,8 +730,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if let Some(notif) = app.notifications.current() {
         if notif.kind == NotificationKind::Error {
             let is_welcome_screen = app.messages.is_empty()
-                && app.streaming_text.is_empty()
-                && app.streaming_thinking.is_empty()
+                && !app.has_streaming_content()
                 && app.tool_use_blocks.is_empty();
             render_error_modal(frame, size, notif, app.error_modal_scroll_offset, app.footer_right_column_area.get(), is_welcome_screen);
             return; // Don't render other overlays/notifications when error modal is showing
@@ -1012,8 +1011,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             render_startup_notices(frame, app, na);
         }
     } else if app.messages.is_empty()
-        && app.streaming_text.is_empty()
-        && app.streaming_thinking.is_empty()
+        && !app.has_streaming_content()
         && app.tool_use_blocks.is_empty()
     {
         app.last_msg_area.set(Rect::default());
@@ -1240,6 +1238,69 @@ fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width
     lines
 }
 
+fn render_single_content_block_tagged(
+    block: ContentBlock,
+    width: u16,
+    tool_names: &std::collections::HashMap<String, String>,
+    expanded_thinking: &std::collections::HashSet<u64>,
+) -> Vec<(Line<'static>, Option<u64>)> {
+    let message = Message::assistant_blocks(vec![block]);
+    render_transcript_assistant_message_tagged(
+        &message,
+        &RenderContext {
+            width,
+            highlight: true,
+            show_thinking: false,
+            tool_names: tool_names.clone(),
+            expanded_thinking: expanded_thinking.clone(),
+        },
+    )
+}
+
+fn render_tool_use_block_lines_for_content(
+    lines: &mut Vec<Line<'static>>,
+    block: &ContentBlock,
+    tool_blocks: &[&ToolUseBlock],
+    turn_active: bool,
+    frame_count: u64,
+) -> Option<String> {
+    if let ContentBlock::ToolUse { id, name, input } = block {
+        if let Some(tool_block) = tool_blocks.iter().find(|tool_block| tool_block.id == *id) {
+            render_tool_block_lines(lines, tool_block, frame_count);
+        } else {
+            // Stored transcripts may have assistant tool-use content without
+            // live ToolStart/ToolEnd state. Render a local card so replayed
+            // Bedrock/OpenAI-compatible sessions keep the same visual ordering.
+            let fallback = ToolUseBlock {
+                id: id.clone(),
+                name: name.clone(),
+                turn_index: None,
+                status: if turn_active { ToolStatus::Running } else { ToolStatus::Done },
+                output_preview: None,
+                input_json: input.to_string(),
+            };
+            render_tool_block_lines(lines, &fallback, frame_count);
+        }
+        return Some(id.clone());
+    }
+
+    None
+}
+
+fn message_tool_result_ids(message: &Message) -> std::collections::HashSet<String> {
+    message
+        .content_blocks()
+        .into_iter()
+        .filter_map(|block| {
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                Some(tool_use_id)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn append_turn_items(
     items: &mut Vec<RenderedLineItem>,
     turn: &TranscriptTurn<'_>,
@@ -1262,31 +1323,144 @@ fn append_turn_items(
     }
 
     let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
-    // Tool events are emitted after the model's tool-use message is parsed but
-    // before the follow-up assistant answer. Claurst stores the visible tool
-    // cards separately from assistant messages, so render them before the
-    // assistant text to preserve the visible operation order.
+    let mut rendered_tool_ids = std::collections::HashSet::new();
+    let has_ordered_tool_use_blocks = turn.assistant_messages.iter().any(|(_, message)| {
+        message
+            .content_blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+    }) || turn
+        .live_blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+
+    if !has_ordered_tool_use_blocks {
+        for block in &turn.tool_blocks {
+            let mut lines = Vec::new();
+            render_tool_block_lines(&mut lines, block, frame_count);
+            if !lines.is_empty() {
+                rendered_tool_ids.insert(block.id.clone());
+                sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
+            }
+        }
+    }
+
+    enum TurnEvent<'a> {
+        Assistant(usize, &'a Message),
+        ToolResult(usize, &'a Message),
+    }
+
+    let mut ordered_events = Vec::new();
+    ordered_events.extend(
+        turn.assistant_messages
+            .iter()
+            .map(|(index, message)| TurnEvent::Assistant(*index, *message)),
+    );
+    ordered_events.extend(
+        turn.tool_result_messages
+            .iter()
+            .map(|(index, message)| TurnEvent::ToolResult(*index, *message)),
+    );
+    ordered_events.sort_by_key(|event| match event {
+        TurnEvent::Assistant(index, _) | TurnEvent::ToolResult(index, _) => *index,
+    });
+
+    for event in ordered_events {
+        match event {
+            TurnEvent::Assistant(message_index, message) => {
+                for block in message.content_blocks() {
+                    let mut tool_lines = Vec::new();
+                    if let Some(tool_id) = render_tool_use_block_lines_for_content(
+                        &mut tool_lines,
+                        &block,
+                        &turn.tool_blocks,
+                        turn.active,
+                        frame_count,
+                    ) {
+                        rendered_tool_ids.insert(tool_id);
+                        if !tool_lines.is_empty() {
+                            sections.push((SectionContent::Plain(tool_lines), Some(message_index)));
+                        }
+                        continue;
+                    }
+
+                    let tagged = render_single_content_block_tagged(
+                        block,
+                        width,
+                        tool_names,
+                        expanded_thinking,
+                    );
+                    if !tagged.is_empty() {
+                        sections.push((SectionContent::Tagged(tagged), Some(message_index)));
+                    }
+                }
+            }
+            TurnEvent::ToolResult(message_index, message) => {
+                let result_ids = message_tool_result_ids(message);
+                let has_rendered_tool_result = !result_ids.is_empty()
+                    && result_ids.iter().all(|id| {
+                        rendered_tool_ids.contains(id)
+                            && turn
+                                .tool_blocks
+                                .iter()
+                                .any(|tool_block| tool_block.id == *id && tool_block.output_preview.is_some())
+                    });
+                if has_rendered_tool_result {
+                    continue;
+                }
+
+                let tagged = render_transcript_assistant_message_tagged(
+                    message,
+                    &RenderContext {
+                        width,
+                        highlight: true,
+                        show_thinking: false,
+                        tool_names: tool_names.clone(),
+                        expanded_thinking: expanded_thinking.clone(),
+                    },
+                );
+                if !tagged.is_empty() {
+                    sections.push((SectionContent::Tagged(tagged), Some(message_index)));
+                }
+            }
+        }
+    }
+
+    for block in &turn.live_blocks {
+        let mut tool_lines = Vec::new();
+        if let Some(tool_id) = render_tool_use_block_lines_for_content(
+            &mut tool_lines,
+            block,
+            &turn.tool_blocks,
+            turn.active,
+            frame_count,
+        ) {
+            rendered_tool_ids.insert(tool_id);
+            if !tool_lines.is_empty() {
+                sections.push((SectionContent::Plain(tool_lines), Some(turn.primary_message_index())));
+            }
+            continue;
+        }
+
+        let tagged = render_single_content_block_tagged(
+            block.clone(),
+            width,
+            tool_names,
+            expanded_thinking,
+        );
+        if !tagged.is_empty() {
+            sections.push((SectionContent::Tagged(tagged), Some(turn.primary_message_index())));
+        }
+    }
+
     for block in &turn.tool_blocks {
+        if rendered_tool_ids.contains(&block.id) {
+            continue;
+        }
         let mut lines = Vec::new();
         render_tool_block_lines(&mut lines, block, frame_count);
         if !lines.is_empty() {
             sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
-        }
-    }
-
-    for (message_index, message) in &turn.assistant_messages {
-        let tagged = render_transcript_assistant_message_tagged(
-            message,
-            &RenderContext {
-                width,
-                highlight: true,
-                show_thinking: false,
-                tool_names: tool_names.clone(),
-                expanded_thinking: expanded_thinking.clone(),
-            },
-        );
-        if !tagged.is_empty() {
-            sections.push((SectionContent::Tagged(tagged), Some(*message_index)));
         }
     }
 
@@ -1301,6 +1475,7 @@ fn append_turn_items(
     // thinking content has arrived yet — gives visual feedback that the
     // model is working (especially for providers without thinking support).
     if turn.active
+        && turn.live_blocks.is_empty()
         && turn.live_text.is_none()
         && turn.live_thinking.is_none()
         && turn.tool_blocks.iter().all(|b| b.status != ToolStatus::Running)
@@ -1346,9 +1521,7 @@ fn append_turn_items(
 }
 
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
-    let streaming = app.is_streaming
-        || !app.streaming_text.is_empty()
-        || !app.streaming_thinking.is_empty();
+    let streaming = app.is_streaming || app.has_streaming_content();
     let has_running_tool_blocks = app
         .tool_use_blocks
         .iter()
@@ -3129,7 +3302,7 @@ mod tool_block_tests {
     use crate::app::{App, ToolStatus, ToolUseBlock};
     use claurst_core::config::Config;
     use claurst_core::cost::CostTracker;
-    use claurst_core::types::Message;
+    use claurst_core::types::{ContentBlock, Message, ToolResultContent};
 
     fn block(name: &str, status: ToolStatus, input: &str, preview: Option<&str>) -> ToolUseBlock {
         ToolUseBlock {
@@ -3284,5 +3457,73 @@ mod tool_block_tests {
             .expect("assistant text should render");
 
         assert!(tool_pos < final_pos, "rendered order was {rendered:?}");
+    }
+
+    #[test]
+    fn turn_renders_ordered_tool_use_result_and_final_text() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.messages.push(Message::user("please inspect the repo"));
+        app.messages.push(Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "I will inspect it.".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({ "file_path": "README.md" }),
+            },
+        ]));
+        app.messages.push(Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: ToolResultContent::Text("file contents".to_string()),
+            is_error: Some(false),
+        }]));
+        app.messages
+            .push(Message::assistant("final response after tools"));
+        app.tool_use_blocks.push(ToolUseBlock {
+            id: "tool-1".to_string(),
+            name: "Read".to_string(),
+            turn_index: Some(0),
+            status: ToolStatus::Done,
+            output_preview: Some("file contents".to_string()),
+            input_json: serde_json::json!({ "file_path": "README.md" }).to_string(),
+        });
+
+        let turns = build_transcript_turns(&app);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].assistant_messages.len(), 2);
+        assert_eq!(turns[0].tool_result_messages.len(), 1);
+
+        let mut items = Vec::new();
+        append_turn_items(
+            &mut items,
+            &turns[0],
+            100,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            0,
+            Color::White,
+        );
+        let rendered = items
+            .iter()
+            .map(|item| item.search_text.as_str())
+            .collect::<Vec<_>>();
+        let first_text_pos = rendered
+            .iter()
+            .position(|line| line.contains("I will inspect it."))
+            .expect("first assistant text should render");
+        let tool_pos = rendered
+            .iter()
+            .position(|line| line.contains("README.md"))
+            .expect("tool block should render");
+        let final_pos = rendered
+            .iter()
+            .position(|line| line.contains("final response after tools"))
+            .expect("assistant text should render");
+
+        assert!(
+            first_text_pos < tool_pos && tool_pos < final_pos,
+            "rendered order was {rendered:?}"
+        );
     }
 }

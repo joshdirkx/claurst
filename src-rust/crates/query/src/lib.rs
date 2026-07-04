@@ -1216,14 +1216,14 @@ pub async fn run_query_loop(
                         }
                     };
 
-                    // Accumulators for building the final assistant message.
-                    let mut text_chunks: Vec<String> = Vec::new();
-                    // Accumulate reasoning/thinking content for providers like
-                    // DeepSeek that require reasoning_content to be sent back.
-                    let mut thinking_chunks: Vec<String> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json)
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
-                        std::collections::HashMap::new();
+                    // Preserve provider stream order by normalizing all non-Anthropic
+                    // streams into Anthropic-style block boundaries, then using the
+                    // same accumulator as the native Anthropic path. Bedrock-hosted
+                    // open models often emit thinking/text/tool events in subtly
+                    // different shapes; rebuilding those into fixed buckets makes the
+                    // TUI show final text before the work that produced it.
+                    let mut accumulator = StreamAccumulator::new();
+                    let mut stream_normalizer = ProviderStreamNormalizer::default();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
@@ -1252,10 +1252,12 @@ pub async fn run_query_loop(
                                         break;
                                     }
                                     Some(Ok(evt)) => {
-                                        // Forward to TUI via AnthropicStreamEvent mapping.
-                                        if let Some(ref tx) = event_tx {
-                                            if let Some(ae) = map_to_anthropic_event(&evt) {
-                                                let _ = tx.send(QueryEvent::Stream(ae));
+                                        if let Some(ae) = map_to_anthropic_event(&evt) {
+                                            for normalized in stream_normalizer.normalize(ae) {
+                                                accumulator.on_event(&normalized);
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::Stream(normalized));
+                                                }
                                             }
                                         }
 
@@ -1266,25 +1268,6 @@ pub async fn run_query_loop(
                                                 usage.input_tokens = u.input_tokens;
                                                 usage.cache_read_input_tokens = u.cache_read_input_tokens;
                                                 usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart { index, content_block } => {
-                                                if let ContentBlock::ToolUse { id, name, .. } = content_block {
-                                                    tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
-                                                }
-                                            }
-                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
-                                                text_chunks.push(text.clone());
-                                            }
-                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
-                                                thinking_chunks.push(thinking.clone());
-                                            }
-                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
-                                                thinking_chunks.push(reasoning.clone());
-                                            }
-                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
-                                                    buf.push_str(partial_json);
-                                                }
                                             }
                                             claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
                                                 if let Some(stop_reason) = stop_reason {
@@ -1329,6 +1312,13 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    for normalized in stream_normalizer.finish() {
+                        accumulator.on_event(&normalized);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Stream(normalized));
+                        }
+                    }
+
                     // If the stream stalled (no data for 45s), retry.
                     if provider_stream_stalled && retries_left > 0 {
                         retries_left -= 1;
@@ -1343,42 +1333,8 @@ pub async fn run_query_loop(
                         continue;
                     }
 
-                    // Build the content blocks from accumulated stream data.
-                    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-
-                    // Thinking / reasoning block — must come first so that
-                    // inject_reasoning_for_tool_turns can find it later.
-                    let combined_thinking = thinking_chunks.join("");
-                    if !combined_thinking.is_empty() {
-                        content_blocks.push(ContentBlock::Thinking {
-                            thinking: combined_thinking.clone(),
-                            signature: String::new(),
-                        });
-                    }
-
-                    let combined_text = text_chunks.join("");
-                    if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text.clone() });
-                    }
-
-                    // Reconstruct tool-use blocks (sorted by index for determinism).
-                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
-                    tc_indices.sort();
-                    for idx in tc_indices {
-                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
-                            let input: serde_json::Value = serde_json::from_str(&json_str)
-                                .unwrap_or(serde_json::json!({}));
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input });
-                        }
-                    }
-
-                    let mut assistant_msg = Message {
-                        role: claurst_core::types::Role::Assistant,
-                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
-                        uuid: Some(msg_id),
-                        cost: None,
-                        snapshot_patch: None,
-                    };
+                    let (mut assistant_msg, _, _) = accumulator.finish();
+                    assistant_msg.uuid = Some(msg_id);
 
                     cost_tracker.add_usage(
                         usage.input_tokens,
@@ -1390,7 +1346,7 @@ pub async fn run_query_loop(
                     messages.push(assistant_msg.clone());
 
                     // Handle tool-use turn: execute tools and loop.
-                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
+                    let tool_use_blocks: Vec<_> = assistant_msg.content_blocks().iter().filter_map(|b| {
                         if let ContentBlock::ToolUse { id, name, input } = b {
                             Some((id.clone(), name.clone(), input.clone()))
                         } else {
@@ -1446,7 +1402,17 @@ pub async fn run_query_loop(
                     // screen ("agent randomly stops"). Surface a placeholder
                     // so the user always sees *some* assistant output and
                     // knows the turn really ended.
-                    if combined_text.is_empty() && combined_thinking.is_empty() {
+                    let has_assistant_content = assistant_msg.content_blocks().iter().any(|block| {
+                        match block {
+                            ContentBlock::Text { text } => !text.is_empty(),
+                            ContentBlock::Thinking { thinking, .. } => !thinking.is_empty(),
+                            ContentBlock::ToolUse { .. }
+                            | ContentBlock::ToolResult { .. }
+                            | ContentBlock::RedactedThinking { .. } => true,
+                            _ => true,
+                        }
+                    });
+                    if !has_assistant_content {
                         let placeholder = format!(
                             "(no response — model ended the turn with stop_reason \"{}\")",
                             stop_str
@@ -2262,6 +2228,154 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
 // Provider stream event mapping
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSyntheticBlockKind {
+    Text,
+    Thinking,
+}
+
+#[derive(Debug, Default)]
+struct ProviderStreamNormalizer {
+    explicit_open_blocks: std::collections::HashSet<usize>,
+    synthetic_open_block: Option<(usize, ProviderSyntheticBlockKind)>,
+    next_synthetic_index: usize,
+}
+
+impl ProviderStreamNormalizer {
+    fn normalize(
+        &mut self,
+        event: claurst_api::AnthropicStreamEvent,
+    ) -> Vec<claurst_api::AnthropicStreamEvent> {
+        use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
+
+        match event {
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                let mut out = self.close_synthetic_block();
+                self.explicit_open_blocks.insert(index);
+                self.next_synthetic_index = self.next_synthetic_index.max(index + 1);
+                out.push(AnthropicStreamEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                });
+                out
+            }
+            AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
+                if self.explicit_open_blocks.contains(&index) {
+                    return vec![AnthropicStreamEvent::ContentBlockDelta { index, delta }];
+                }
+
+                match delta {
+                    ContentDelta::TextDelta { text } => {
+                        let mut out = self.ensure_synthetic_block(ProviderSyntheticBlockKind::Text);
+                        let synthetic_index = self.synthetic_open_block.expect("synthetic block opened").0;
+                        out.push(AnthropicStreamEvent::ContentBlockDelta {
+                            index: synthetic_index,
+                            delta: ContentDelta::TextDelta { text },
+                        });
+                        out
+                    }
+                    ContentDelta::ThinkingDelta { thinking } => {
+                        let mut out = self.ensure_synthetic_block(ProviderSyntheticBlockKind::Thinking);
+                        let synthetic_index = self.synthetic_open_block.expect("synthetic block opened").0;
+                        out.push(AnthropicStreamEvent::ContentBlockDelta {
+                            index: synthetic_index,
+                            delta: ContentDelta::ThinkingDelta { thinking },
+                        });
+                        out
+                    }
+                    ContentDelta::SignatureDelta { signature } => {
+                        let mut out = self.ensure_synthetic_block(ProviderSyntheticBlockKind::Thinking);
+                        let synthetic_index = self.synthetic_open_block.expect("synthetic block opened").0;
+                        out.push(AnthropicStreamEvent::ContentBlockDelta {
+                            index: synthetic_index,
+                            delta: ContentDelta::SignatureDelta { signature },
+                        });
+                        out
+                    }
+                    // Tool-use JSON deltas require a real tool-use start frame with
+                    // the provider's id/name. If a provider omits that frame, keeping
+                    // the delta unwrapped makes the unsupported shape visible without
+                    // inventing an invalid tool call.
+                    other => vec![AnthropicStreamEvent::ContentBlockDelta { index, delta: other }],
+                }
+            }
+            AnthropicStreamEvent::ContentBlockStop { index } => {
+                if self.explicit_open_blocks.remove(&index) {
+                    return vec![AnthropicStreamEvent::ContentBlockStop { index }];
+                }
+                if self
+                    .synthetic_open_block
+                    .map(|(synthetic_index, _)| synthetic_index == index)
+                    .unwrap_or(false)
+                {
+                    self.synthetic_open_block = None;
+                    return vec![AnthropicStreamEvent::ContentBlockStop { index }];
+                }
+                Vec::new()
+            }
+            AnthropicStreamEvent::MessageDelta { .. }
+            | AnthropicStreamEvent::MessageStop
+            | AnthropicStreamEvent::Error { .. } => {
+                let mut out = self.close_synthetic_block();
+                out.push(event);
+                out
+            }
+            other => vec![other],
+        }
+    }
+
+    fn finish(&mut self) -> Vec<claurst_api::AnthropicStreamEvent> {
+        self.close_synthetic_block()
+    }
+
+    fn ensure_synthetic_block(
+        &mut self,
+        kind: ProviderSyntheticBlockKind,
+    ) -> Vec<claurst_api::AnthropicStreamEvent> {
+        use claurst_api::streaming::AnthropicStreamEvent;
+
+        if self
+            .synthetic_open_block
+            .map(|(_, open_kind)| open_kind == kind)
+            .unwrap_or(false)
+        {
+            return Vec::new();
+        }
+
+        let mut out = self.close_synthetic_block();
+        let index = self.next_synthetic_index;
+        self.next_synthetic_index += 1;
+        self.synthetic_open_block = Some((index, kind));
+        let content_block = match kind {
+            ProviderSyntheticBlockKind::Text => ContentBlock::Text {
+                text: String::new(),
+            },
+            ProviderSyntheticBlockKind::Thinking => ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        };
+        out.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block,
+        });
+        out
+    }
+
+    fn close_synthetic_block(&mut self) -> Vec<claurst_api::AnthropicStreamEvent> {
+        use claurst_api::streaming::AnthropicStreamEvent;
+
+        if let Some((index, _)) = self.synthetic_open_block.take() {
+            vec![AnthropicStreamEvent::ContentBlockStop { index }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 /// Map a unified `StreamEvent` (from a non-Anthropic provider) onto the
 /// equivalent `AnthropicStreamEvent` so that the TUI stream consumer sees a
 /// single, consistent event type regardless of which provider produced it.
@@ -2378,6 +2492,50 @@ mod tests {
             model_registry: None,
             managed_agents: None,
         }
+    }
+
+    #[test]
+    fn provider_stream_normalizer_wraps_bare_thinking_and_text_deltas_in_order() {
+        use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
+
+        let mut normalizer = ProviderStreamNormalizer::default();
+        let mut accumulator = StreamAccumulator::new();
+
+        let events = [
+            AnthropicStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentDelta::ThinkingDelta {
+                    thinking: "thinking first".to_string(),
+                },
+            },
+            AnthropicStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentDelta::TextDelta {
+                    text: "answer second".to_string(),
+                },
+            },
+            AnthropicStreamEvent::MessageStop,
+        ];
+
+        for event in events {
+            for normalized in normalizer.normalize(event) {
+                accumulator.on_event(&normalized);
+            }
+        }
+        for normalized in normalizer.finish() {
+            accumulator.on_event(&normalized);
+        }
+
+        let (message, _, _) = accumulator.finish();
+        let blocks = message.content_blocks();
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { thinking, .. } if thinking == "thinking first"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "answer second"
+        ));
     }
 
     // ---- build_system_prompt tests ------------------------------------------

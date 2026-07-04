@@ -8,7 +8,9 @@ pub struct TranscriptTurn<'a> {
     pub end_message_index: usize,
     pub user_message: &'a Message,
     pub assistant_messages: Vec<(usize, &'a Message)>,
+    pub tool_result_messages: Vec<(usize, &'a Message)>,
     pub tool_blocks: Vec<&'a ToolUseBlock>,
+    pub live_blocks: Vec<ContentBlock>,
     pub live_text: Option<&'a str>,
     pub live_thinking: Option<&'a str>,
     pub metadata: Option<&'a TurnMetadata>,
@@ -26,12 +28,22 @@ impl<'a> TranscriptTurn<'a> {
 
     pub fn has_visible_assistant_content(&self) -> bool {
         !self.assistant_messages.is_empty()
+            || !self.tool_result_messages.is_empty()
             || !self.tool_blocks.is_empty()
+            || !self.live_blocks.is_empty()
             || self.live_text.is_some()
             || self.live_thinking.is_some()
     }
 
     pub fn reasoning_heading(&self) -> Option<String> {
+        for block in self.live_blocks.iter().rev() {
+            if let ContentBlock::Thinking { thinking, .. } = block {
+                if let Some(text) = reasoning_heading(thinking) {
+                    return Some(text);
+                }
+            }
+        }
+
         if let Some(text) = self.live_thinking.and_then(reasoning_heading) {
             return Some(text);
         }
@@ -89,6 +101,7 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
         user_index: usize,
         end_message_index: usize,
         assistant_indices: Vec<usize>,
+        tool_result_indices: Vec<usize>,
     }
 
     let mut drafts = Vec::new();
@@ -98,6 +111,14 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
     for (index, message) in app.messages.iter().enumerate() {
         match message.role {
             Role::User => {
+                if is_tool_result_message(message) {
+                    if let Some(turn) = current.as_mut() {
+                        turn.tool_result_indices.push(index);
+                        turn.end_message_index = index;
+                        continue;
+                    }
+                }
+
                 if let Some(turn) = current.take() {
                     drafts.push(turn);
                 }
@@ -107,6 +128,7 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
                     user_index: index,
                     end_message_index: index,
                     assistant_indices: Vec::new(),
+                    tool_result_indices: Vec::new(),
                 });
                 ordinal += 1;
             }
@@ -137,7 +159,13 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
                     .into_iter()
                     .filter_map(|index| app.messages.get(index).map(|message| (index, message)))
                     .collect(),
+                tool_result_messages: draft
+                    .tool_result_indices
+                    .into_iter()
+                    .filter_map(|index| app.messages.get(index).map(|message| (index, message)))
+                    .collect(),
                 tool_blocks: Vec::new(),
+                live_blocks: Vec::new(),
                 live_text: None,
                 live_thinking: None,
                 metadata: app.turn_metadata.get(draft.ordinal),
@@ -161,15 +189,26 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
     }
 
     if let Some(last) = turns.last_mut() {
-        if !app.streaming_text.is_empty() {
-            last.live_text = Some(app.streaming_text.as_str());
-        }
-        if !app.streaming_thinking.is_empty() {
-            last.live_thinking = Some(app.streaming_thinking.as_str());
+        last.live_blocks = app.streaming_content_blocks();
+        if last.live_blocks.is_empty() {
+            if !app.streaming_text.is_empty() {
+                last.live_text = Some(app.streaming_text.as_str());
+            }
+            if !app.streaming_thinking.is_empty() {
+                last.live_thinking = Some(app.streaming_thinking.as_str());
+            }
         }
 
         last.active = app.is_streaming || last.tool_blocks.iter().any(|block| block.status == ToolStatus::Running);
     }
 
     turns
+}
+
+fn is_tool_result_message(message: &Message) -> bool {
+    message.role == Role::User
+        && message
+            .content_blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }

@@ -1354,6 +1354,64 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_blocks_flush_in_stream_order() {
+        let mut app = make_app();
+
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            },
+        ));
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: claurst_api::streaming::ContentDelta::ThinkingDelta {
+                    thinking: "consider options".to_string(),
+                },
+            },
+        ));
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::ContentBlockStop { index: 0 },
+        ));
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
+            },
+        ));
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: claurst_api::streaming::ContentDelta::TextDelta {
+                    text: "final answer".to_string(),
+                },
+            },
+        ));
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::ContentBlockStop { index: 1 },
+        ));
+        app.handle_query_event(claurst_query::QueryEvent::Stream(
+            claurst_api::AnthropicStreamEvent::MessageStop,
+        ));
+
+        let blocks = app.messages[0].content_blocks();
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { thinking, .. } if thinking == "consider options"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "final answer"
+        ));
+    }
+
+    #[test]
     fn test_render_app_transcript_uses_turn_metadata_without_legacy_glyph() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();

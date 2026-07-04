@@ -2729,7 +2729,7 @@ async fn run_interactive(
 
                         // Start async query
                         app.is_streaming = true;
-                        app.streaming_text.clear();
+                        app.clear_streaming_content();
 
                         let ct = CancellationToken::new();
                         cancel = Some(ct.clone());
@@ -3243,7 +3243,7 @@ async fn run_interactive(
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
                         app.is_streaming = true;
-                        app.streaming_text.clear();
+                        app.clear_streaming_content();
                         let ct = CancellationToken::new();
                         cancel = Some(ct.clone());
                         let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
@@ -3351,7 +3351,7 @@ async fn run_interactive(
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 app.is_streaming = true;
-                app.streaming_text.clear();
+                app.clear_streaming_content();
                 let ct = CancellationToken::new();
                 cancel = Some(ct.clone());
                 let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
@@ -3768,7 +3768,7 @@ async fn run_interactive(
                             session.messages = messages.clone();
                             session.updated_at = chrono::Utc::now();
                             app.is_streaming = true;
-                            app.streaming_text.clear();
+                            app.clear_streaming_content();
 
                             let ct = CancellationToken::new();
                             cancel = Some(ct.clone());

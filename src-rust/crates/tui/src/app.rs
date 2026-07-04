@@ -430,6 +430,157 @@ pub struct ToolUseBlock {
     pub input_json: String,
 }
 
+#[derive(Debug, Clone)]
+enum StreamingPartialBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        json_buf: String,
+    },
+    Thinking {
+        thinking_buf: String,
+        signature_buf: String,
+    },
+}
+
+impl StreamingPartialBlock {
+    fn into_content_block(self) -> ContentBlock {
+        match self {
+            StreamingPartialBlock::Text(text) => ContentBlock::Text { text },
+            StreamingPartialBlock::ToolUse { id, name, json_buf } => {
+                let input = serde_json::from_str(&json_buf)
+                    .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                ContentBlock::ToolUse { id, name, input }
+            }
+            StreamingPartialBlock::Thinking { thinking_buf, signature_buf } => {
+                ContentBlock::Thinking {
+                    thinking: thinking_buf,
+                    signature: signature_buf,
+                }
+            }
+        }
+    }
+
+    fn to_content_block(&self) -> ContentBlock {
+        self.clone().into_content_block()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct StreamingContentState {
+    order: Vec<usize>,
+    completed: std::collections::HashMap<usize, ContentBlock>,
+    partials: std::collections::HashMap<usize, StreamingPartialBlock>,
+}
+
+impl StreamingContentState {
+    fn clear(&mut self) {
+        self.order.clear();
+        self.completed.clear();
+        self.partials.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty() && self.completed.is_empty() && self.partials.is_empty()
+    }
+
+    fn start(&mut self, index: usize, content_block: ContentBlock) {
+        self.ensure_order(index);
+        let partial = match content_block {
+            ContentBlock::Text { text } => StreamingPartialBlock::Text(text),
+            ContentBlock::ToolUse { id, name, .. } => StreamingPartialBlock::ToolUse {
+                id,
+                name,
+                json_buf: String::new(),
+            },
+            ContentBlock::Thinking { thinking, signature } => StreamingPartialBlock::Thinking {
+                thinking_buf: thinking,
+                signature_buf: signature,
+            },
+            _ => return,
+        };
+        self.completed.remove(&index);
+        self.partials.insert(index, partial);
+    }
+
+    fn push_delta(&mut self, index: usize, delta: claurst_api::streaming::ContentDelta) {
+        use claurst_api::streaming::ContentDelta;
+
+        if !self.partials.contains_key(&index) {
+            match &delta {
+                ContentDelta::TextDelta { .. } => {
+                    self.start(index, ContentBlock::Text { text: String::new() });
+                }
+                ContentDelta::ThinkingDelta { .. } | ContentDelta::SignatureDelta { .. } => {
+                    self.start(index, ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: String::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(partial) = self.partials.get_mut(&index) {
+            match (partial, delta) {
+                (StreamingPartialBlock::Text(buf), ContentDelta::TextDelta { text }) => {
+                    buf.push_str(&text);
+                }
+                (
+                    StreamingPartialBlock::Thinking { thinking_buf, .. },
+                    ContentDelta::ThinkingDelta { thinking },
+                ) => {
+                    thinking_buf.push_str(&thinking);
+                }
+                (
+                    StreamingPartialBlock::Thinking { signature_buf, .. },
+                    ContentDelta::SignatureDelta { signature },
+                ) => {
+                    signature_buf.push_str(&signature);
+                }
+                (
+                    StreamingPartialBlock::ToolUse { json_buf, .. },
+                    ContentDelta::InputJsonDelta { partial_json },
+                ) => {
+                    json_buf.push_str(&partial_json);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn stop(&mut self, index: usize) {
+        if let Some(partial) = self.partials.remove(&index) {
+            self.completed.insert(index, partial.into_content_block());
+        }
+    }
+
+    fn blocks(&self) -> Vec<ContentBlock> {
+        self.order
+            .iter()
+            .filter_map(|index| {
+                self.completed
+                    .get(index)
+                    .cloned()
+                    .or_else(|| self.partials.get(index).map(StreamingPartialBlock::to_content_block))
+            })
+            .collect()
+    }
+
+    fn take_blocks(&mut self) -> Vec<ContentBlock> {
+        let blocks = self.blocks();
+        self.clear();
+        blocks
+    }
+
+    fn ensure_order(&mut self, index: usize) {
+        if !self.order.contains(&index) {
+            self.order.push(index);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TurnMetadata {
     pub submitted_at: Option<String>,
@@ -753,6 +904,7 @@ pub struct App {
     pub is_streaming: bool,
     pub streaming_text: String,
     pub streaming_thinking: String,
+    streaming_content: StreamingContentState,
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
@@ -1275,6 +1427,7 @@ impl App {
             is_streaming: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            streaming_content: StreamingContentState::default(),
             status_message: None,
             spinner_verb: None,
             should_exit: false,
@@ -1652,25 +1805,46 @@ impl App {
         }
     }
 
+    pub fn streaming_content_blocks(&self) -> Vec<ContentBlock> {
+        self.streaming_content.blocks()
+    }
+
+    pub fn has_streaming_content(&self) -> bool {
+        !self.streaming_content.is_empty()
+            || !self.streaming_text.is_empty()
+            || !self.streaming_thinking.is_empty()
+    }
+
+    pub fn clear_streaming_content(&mut self) {
+        self.streaming_text.clear();
+        self.streaming_thinking.clear();
+        self.streaming_content.clear();
+    }
+
     fn flush_streamed_assistant_message(&mut self) {
-        if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
-            self.streaming_text.clear();
-            self.streaming_thinking.clear();
+        let mut blocks = self.streaming_content.take_blocks();
+
+        if blocks.is_empty()
+            && self.streaming_text.trim().is_empty()
+            && self.streaming_thinking.trim().is_empty()
+        {
+            self.clear_streaming_content();
             return;
         }
 
         let thinking = std::mem::take(&mut self.streaming_thinking);
         let text = std::mem::take(&mut self.streaming_text);
 
-        let mut blocks = Vec::new();
-        if !thinking.trim().is_empty() {
-            blocks.push(ContentBlock::Thinking {
-                thinking,
-                signature: String::new(),
-            });
-        }
-        if !text.is_empty() {
-            blocks.push(ContentBlock::Text { text });
+        if blocks.is_empty() {
+            if !thinking.trim().is_empty() {
+                blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature: String::new(),
+                });
+            }
+            if !text.is_empty() {
+                blocks.push(ContentBlock::Text { text });
+            }
         }
 
         let msg = match blocks.len() {
@@ -2180,8 +2354,7 @@ impl App {
                 self.messages.clear();
                 self.system_annotations.clear();
                 self.display_messages.clear();
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
+                self.clear_streaming_content();
                 self.tool_use_blocks.clear();
                 self.turn_metadata.clear();
                 self.cost_usd = 0.0;
@@ -4237,8 +4410,7 @@ impl App {
             KeyCode::Esc if self.is_streaming => {
                 self.is_streaming = false;
                 self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
+                self.clear_streaming_content();
                 self.tool_use_blocks.clear();
                 self.status_message = Some("Cancelled.".to_string());
                 self.complete_current_turn_snapshot(true);
@@ -4263,8 +4435,7 @@ impl App {
                     // Cancel streaming.
                     self.is_streaming = false;
                     self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
+                    self.clear_streaming_content();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                     self.complete_current_turn_snapshot(true);
@@ -4942,8 +5113,7 @@ impl App {
                 if self.is_streaming {
                     self.is_streaming = false;
                     self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
+                    self.clear_streaming_content();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
@@ -6150,13 +6320,18 @@ impl App {
                     if self.turn_start.is_none() {
                         self.turn_start = Some(std::time::Instant::now());
                     }
-                    self.streaming_thinking.clear();
+                    self.clear_streaming_content();
                 }
                 self.is_streaming = true;
                 match stream_evt {
-                    claurst_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
+                    claurst_api::AnthropicStreamEvent::ContentBlockStart { index, content_block } => {
+                        self.streaming_content.start(index, content_block);
+                        self.invalidate_transcript();
+                    }
+                    claurst_api::AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
+                        self.streaming_content.push_delta(index, delta.clone());
                         match delta {
                             claurst_api::streaming::ContentDelta::TextDelta { text } => {
                                 self.streaming_text.push_str(&text);
@@ -6169,6 +6344,10 @@ impl App {
                             }
                             _ => {}
                         }
+                    }
+                    claurst_api::AnthropicStreamEvent::ContentBlockStop { index } => {
+                        self.streaming_content.stop(index);
+                        self.invalidate_transcript();
                     }
                     claurst_api::AnthropicStreamEvent::MessageStop => {
                         self.is_streaming = false;
@@ -6280,8 +6459,7 @@ impl App {
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
                 self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
+                self.clear_streaming_content();
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
