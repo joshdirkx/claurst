@@ -501,7 +501,14 @@ impl BedrockProvider {
                     }
                 }))
             }
-            ContentBlock::Thinking { thinking, .. } => Some(json!({ "text": thinking })),
+            ContentBlock::Thinking { .. } => {
+                // Bedrock Converse has no provider-neutral thinking block.
+                // Serializing local thinking as plain text leaks scratchpad
+                // content into follow-up turns, which is especially visible
+                // with Qwen-style `<think>` output. Keep the block for local
+                // transcript display, but do not round-trip it to Bedrock.
+                None
+            }
             _ => None,
         }
     }
@@ -671,31 +678,28 @@ impl BedrockProvider {
             None => return vec![],
         };
 
-        blocks
-            .iter()
-            .filter_map(|b| {
-                if let Some(text) = b.get("text").and_then(|v| v.as_str()) {
-                    return Some(ContentBlock::Text {
-                        text: text.to_string(),
-                    });
-                }
-                if let Some(tu) = b.get("toolUse") {
-                    let id = tu
-                        .get("toolUseId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = tu
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let input = tu.get("input").cloned().unwrap_or(json!({}));
-                    return Some(ContentBlock::ToolUse { id, name, input });
-                }
-                None
-            })
-            .collect()
+        let mut content_blocks = Vec::new();
+        for b in blocks {
+            if let Some(text) = b.get("text").and_then(|v| v.as_str()) {
+                content_blocks.extend(split_tagged_thinking_content(text));
+                continue;
+            }
+            if let Some(tu) = b.get("toolUse") {
+                let id = tu
+                    .get("toolUseId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = tu
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input = tu.get("input").cloned().unwrap_or(json!({}));
+                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+        }
+        content_blocks
     }
 
     fn map_stop_reason(reason: &str) -> StopReason {
@@ -791,6 +795,137 @@ impl BedrockPromptCachingOptions {
         }
         json!({ "cachePoint": cache_point })
     }
+}
+
+fn split_tagged_thinking_content(text: &str) -> Vec<ContentBlock> {
+    // Some Bedrock-hosted open models expose reasoning as tagged text rather
+    // than a native Converse content type. Normalize that provider convention
+    // into Claurst's internal Thinking block so the TUI can collapse it and
+    // future Bedrock requests do not receive it back as ordinary assistant
+    // prose. Add new Bedrock family conventions here rather than in the TUI.
+    let mut state = BedrockTaggedThinkingState::default();
+    let mut blocks = Vec::new();
+    for event in state.push_text(0, text) {
+        push_tagged_thinking_block(&mut blocks, event);
+    }
+    for event in state.finish() {
+        push_tagged_thinking_block(&mut blocks, event);
+    }
+    blocks
+}
+
+fn push_tagged_thinking_block(blocks: &mut Vec<ContentBlock>, event: StreamEvent) {
+    match event {
+        StreamEvent::TextDelta { text, .. } if !text.is_empty() => {
+            blocks.push(ContentBlock::Text { text });
+        }
+        StreamEvent::ThinkingDelta { thinking, .. } if !thinking.is_empty() => {
+            blocks.push(ContentBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            });
+        }
+        _ => {}
+    }
+}
+
+#[derive(Default)]
+struct BedrockTaggedThinkingState {
+    pending: String,
+    in_thinking: bool,
+    last_index: usize,
+}
+
+impl BedrockTaggedThinkingState {
+    fn push_text(&mut self, index: usize, text: &str) -> Vec<StreamEvent> {
+        self.last_index = index;
+        self.pending.push_str(text);
+        self.drain(index, false)
+    }
+
+    fn finish(&mut self) -> Vec<StreamEvent> {
+        self.drain(self.last_index, true)
+    }
+
+    fn drain(&mut self, index: usize, finish: bool) -> Vec<StreamEvent> {
+        const OPEN_TAGS: &[&str] = &["<think>", "<thinking>"];
+        const CLOSE_TAGS: &[&str] = &["</think>", "</thinking>"];
+
+        let mut events = Vec::new();
+        loop {
+            let tags = if self.in_thinking { CLOSE_TAGS } else { OPEN_TAGS };
+            if let Some((pos, tag_len)) = find_first_tag(&self.pending, tags) {
+                let before = self.pending[..pos].to_string();
+                self.pending.drain(..pos + tag_len);
+                self.push_delta(&mut events, index, before);
+                self.in_thinking = !self.in_thinking;
+                continue;
+            }
+
+            let flush_len = if finish {
+                self.pending.len()
+            } else {
+                safe_tag_flush_len(&self.pending, tags)
+            };
+            if flush_len > 0 {
+                let text = self.pending[..flush_len].to_string();
+                self.pending.drain(..flush_len);
+                self.push_delta(&mut events, index, text);
+            }
+            break;
+        }
+
+        if finish {
+            self.in_thinking = false;
+        }
+
+        events
+    }
+
+    fn push_delta(&self, events: &mut Vec<StreamEvent>, index: usize, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.in_thinking {
+            events.push(StreamEvent::ThinkingDelta {
+                index,
+                thinking: text,
+            });
+        } else {
+            events.push(StreamEvent::TextDelta { index, text });
+        }
+    }
+}
+
+fn find_first_tag(input: &str, tags: &[&str]) -> Option<(usize, usize)> {
+    let lower = input.to_ascii_lowercase();
+    tags.iter()
+        .filter_map(|tag| lower.find(tag).map(|pos| (pos, tag.len())))
+        .min_by_key(|(pos, _)| *pos)
+}
+
+fn safe_tag_flush_len(input: &str, tags: &[&str]) -> usize {
+    if input.is_empty() {
+        return 0;
+    }
+    let max_keep = tags
+        .iter()
+        .map(|tag| tag.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0)
+        .min(input.len());
+    let lower = input.to_ascii_lowercase();
+    for keep in (1..=max_keep).rev() {
+        let start = input.len().saturating_sub(keep);
+        if !input.is_char_boundary(start) {
+            continue;
+        }
+        let suffix = &lower[start..];
+        if tags.iter().any(|tag| tag.starts_with(suffix)) {
+            return start;
+        }
+    }
+    input.len()
 }
 
 fn parse_bedrock_usage_info(u: &Value) -> UsageInfo {
@@ -898,6 +1033,7 @@ impl LlmProvider for BedrockProvider {
             let mut byte_stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             let mut message_started = false;
+            let mut tagged_thinking = BedrockTaggedThinkingState::default();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -950,7 +1086,7 @@ impl LlmProvider for BedrockProvider {
 
                         let payload = &buf[payload_start..payload_end];
                         if let Ok(val) = serde_json::from_slice::<Value>(payload) {
-                            for ev in parse_bedrock_event(&val, event_type.as_deref(), &provider_id, &mut message_started) {
+                            for ev in parse_bedrock_event(&val, event_type.as_deref(), &provider_id, &mut message_started, &mut tagged_thinking) {
                                 yield ev;
                             }
                         }
@@ -974,7 +1110,7 @@ impl LlmProvider for BedrockProvider {
                     let event_type = extract_event_type(&buf[12..12 + headers_len]);
                     let payload = &buf[payload_start..payload_end];
                     if let Ok(val) = serde_json::from_slice::<Value>(payload) {
-                        for ev in parse_bedrock_event(&val, event_type.as_deref(), &provider_id, &mut message_started) {
+                        for ev in parse_bedrock_event(&val, event_type.as_deref(), &provider_id, &mut message_started, &mut tagged_thinking) {
                             yield ev;
                         }
                     }
@@ -983,6 +1119,9 @@ impl LlmProvider for BedrockProvider {
             }
 
             if message_started {
+                for ev in tagged_thinking.finish() {
+                    yield Ok(ev);
+                }
                 yield Ok(StreamEvent::MessageStop);
             }
         };
@@ -1119,6 +1258,7 @@ fn parse_bedrock_event(
     event_type: Option<&str>,
     provider_id: &ProviderId,
     message_started: &mut bool,
+    tagged_thinking: &mut BedrockTaggedThinkingState,
 ) -> Vec<Result<StreamEvent, ProviderError>> {
     let mut events = Vec::new();
 
@@ -1217,10 +1357,12 @@ fn parse_bedrock_event(
         if let Some(delta) = cb_delta.get("delta") {
             if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
-                    events.push(Ok(StreamEvent::TextDelta {
-                        index,
-                        text: text.to_string(),
-                    }));
+                    events.extend(
+                        tagged_thinking
+                            .push_text(index, text)
+                            .into_iter()
+                            .map(Ok),
+                    );
                 }
             } else if let Some(json_frag) = delta
                 .get("toolUse")
@@ -1246,6 +1388,7 @@ fn parse_bedrock_event(
             .get("contentBlockIndex")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
+        events.extend(tagged_thinking.finish().into_iter().map(Ok));
         events.push(Ok(StreamEvent::ContentBlockStop { index }));
         return events;
     }
@@ -1265,6 +1408,7 @@ fn parse_bedrock_event(
             "stop_sequence" => StopReason::StopSequence,
             other => StopReason::Other(other.to_string()),
         };
+        events.extend(tagged_thinking.finish().into_iter().map(Ok));
         events.push(Ok(StreamEvent::MessageDelta {
             stop_reason: Some(stop_reason),
             usage: None,
@@ -1495,6 +1639,31 @@ mod tests {
     }
 
     #[test]
+    fn converse_body_omits_local_thinking_blocks_for_bedrock_followups() {
+        let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        request.messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "internal plan".to_string(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "visible answer".to_string(),
+                },
+            ]),
+            uuid: None,
+            cost: None,
+            snapshot_patch: None,
+        }];
+
+        let body = BedrockProvider::build_converse_body(&request);
+        let content = body["messages"][0]["content"].as_array().expect("content array");
+
+        assert_eq!(content, &vec![json!({ "text": "visible answer" })]);
+    }
+
+    #[test]
     fn converse_body_omits_reasoning_config_for_deepseek_models() {
         let mut request = test_request("deepseek.v3.2");
         request.thinking = Some(ThinkingConfig::enabled(1024));
@@ -1561,14 +1730,76 @@ mod tests {
     }
 
     #[test]
+    fn parse_converse_content_splits_qwen_tagged_thinking() {
+        let blocks = BedrockProvider::parse_converse_content(Some(&vec![json!({
+            "text": "<think>inspect files</think>Done."
+        })]));
+
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { thinking, .. } if thinking == "inspect files"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "Done."
+        ));
+    }
+
+    #[test]
+    fn stream_splits_qwen_tagged_thinking_across_chunks() {
+        let provider_id = ProviderId::new(ProviderId::AMAZON_BEDROCK);
+        let mut message_started = true;
+        let mut tagged_thinking = BedrockTaggedThinkingState::default();
+
+        let first_events = parse_bedrock_event(
+            &json!({ "contentBlockIndex": 0, "delta": { "text": "<thi" } }),
+            Some("contentBlockDelta"),
+            &provider_id,
+            &mut message_started,
+            &mut tagged_thinking,
+        );
+        assert!(first_events.is_empty());
+
+        let second_events = parse_bedrock_event(
+            &json!({ "contentBlockIndex": 0, "delta": { "text": "nk>inspect</think>Done" } }),
+            Some("contentBlockDelta"),
+            &provider_id,
+            &mut message_started,
+            &mut tagged_thinking,
+        );
+        assert!(matches!(
+            second_events[0].as_ref().expect("thinking event"),
+            StreamEvent::ThinkingDelta { thinking, .. } if thinking == "inspect"
+        ));
+        assert!(second_events.iter().any(|event| matches!(
+            event.as_ref().expect("event"),
+            StreamEvent::TextDelta { text, .. } if text == "Done"
+        )));
+
+        let stop_events = parse_bedrock_event(
+            &json!({ "contentBlockIndex": 0 }),
+            Some("contentBlockStop"),
+            &provider_id,
+            &mut message_started,
+            &mut tagged_thinking,
+        );
+        assert!(stop_events.iter().any(|event| matches!(
+            event.as_ref().expect("event"),
+            StreamEvent::ContentBlockStop { index } if *index == 0
+        )));
+    }
+
+    #[test]
     fn stream_message_stop_waits_for_later_metadata_usage() {
         let provider_id = ProviderId::new(ProviderId::AMAZON_BEDROCK);
         let mut message_started = true;
+        let mut tagged_thinking = BedrockTaggedThinkingState::default();
         let stop_events = parse_bedrock_event(
             &json!({ "stopReason": "tool_use" }),
             Some("messageStop"),
             &provider_id,
             &mut message_started,
+            &mut tagged_thinking,
         );
 
         assert_eq!(stop_events.len(), 1);
@@ -1592,6 +1823,7 @@ mod tests {
             Some("metadata"),
             &provider_id,
             &mut message_started,
+            &mut tagged_thinking,
         );
         let StreamEvent::MessageDelta {
             stop_reason: None,
