@@ -297,7 +297,16 @@ impl BedrockProvider {
     // -----------------------------------------------------------------------
 
     fn build_converse_body(request: &ProviderRequest) -> Value {
-        let prompt_cache = BedrockPromptCachingOptions::from_provider_options(&request.provider_options);
+        let prompt_cache = if Self::model_supports_prompt_caching(&request.model) {
+            BedrockPromptCachingOptions::from_provider_options(&request.provider_options)
+        } else {
+            // `promptCaching` is a Claurst policy request, not a field Bedrock
+            // accepts directly. Only turn it into Converse `cachePoint` blocks
+            // for model families where Bedrock documents that support; open
+            // model adapters like Qwen reject cache points and should keep the
+            // turn working without requiring users to rewrite shared settings.
+            BedrockPromptCachingOptions::disabled()
+        };
         let messages = Self::build_converse_messages(request, &prompt_cache);
         let mut body = json!({
             "messages": messages,
@@ -430,6 +439,16 @@ impl BedrockProvider {
         // `reasoningConfig` is the Bedrock Claude thinking surface. Other
         // families expose reasoning differently or reject the field outright.
         model.contains("anthropic") || model.contains("claude")
+    }
+
+    fn model_supports_prompt_caching(model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        // Bedrock prompt caching is model-family specific. Claude supports
+        // explicit cache points across tools/system/messages. Nova also has
+        // Bedrock prompt-caching support, including automatic caching and
+        // explicit cache points. Qwen, DeepSeek, and Llama currently reject
+        // cache points through Converse, so leave the policy inert for them.
+        model.contains("anthropic") || model.contains("claude") || model.contains("nova")
     }
 
     fn message_content_to_converse(content: &MessageContent, role: &Role) -> Vec<Value> {
@@ -1595,7 +1614,7 @@ mod tests {
 
     #[test]
     fn converse_body_adds_prompt_cache_points_when_enabled() {
-        let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        let mut request = test_request("amazon.nova-2-lite-v1:0");
         request.system_prompt = Some(SystemPrompt::Text("You are Claurst.".to_string()));
         request.tools = vec![test_tool()];
         request.provider_options = json!({
@@ -1617,8 +1636,33 @@ mod tests {
     }
 
     #[test]
-    fn converse_body_keeps_message_cache_points_opt_in() {
+    fn converse_body_ignores_prompt_cache_points_for_qwen_models() {
         let mut request = test_request("qwen.qwen3-coder-30b-a3b-v1:0");
+        request.system_prompt = Some(SystemPrompt::Text("You are Claurst.".to_string()));
+        request.tools = vec![test_tool()];
+        request.provider_options = json!({
+            "promptCaching": {
+                "tools": true,
+                "system": true,
+                "messages": true,
+                "ttl": "5m"
+            }
+        });
+
+        let body = BedrockProvider::build_converse_body(&request);
+
+        let tools = body["toolConfig"]["tools"].as_array().expect("tools array");
+        assert!(tools.iter().all(|tool| tool.get("cachePoint").is_none()));
+        let system = body["system"].as_array().expect("system array");
+        assert!(system.iter().all(|block| block.get("cachePoint").is_none()));
+        let content = body["messages"][0]["content"].as_array().expect("content array");
+        assert!(content.iter().all(|block| block.get("cachePoint").is_none()));
+        assert!(body.get("promptCaching").is_none());
+    }
+
+    #[test]
+    fn converse_body_keeps_message_cache_points_opt_in() {
+        let mut request = test_request("amazon.nova-2-lite-v1:0");
         request.provider_options = json!({ "promptCaching": true });
 
         let body = BedrockProvider::build_converse_body(&request);
