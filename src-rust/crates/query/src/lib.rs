@@ -165,13 +165,18 @@ impl Default for QueryConfig {
 }
 
 impl QueryConfig {
-    pub fn from_config(cfg: &Config) -> Self {
-        let provider_options = cfg
-            .provider
+    pub fn provider_options_for_config(
+        cfg: &Config,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        cfg.provider
             .as_deref()
             .and_then(|provider| cfg.provider_configs.get(provider))
             .map(|provider_cfg| provider_cfg.options.clone())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    pub fn from_config(cfg: &Config) -> Self {
+        let provider_options = Self::provider_options_for_config(cfg);
         Self {
             model: cfg.effective_model().to_string(),
             max_tokens: cfg.effective_max_tokens(),
@@ -194,12 +199,7 @@ impl QueryConfig {
     pub fn from_config_with_registry(cfg: &Config, registry: &claurst_api::ModelRegistry) -> Self {
         // We can't move the Arc here, but we need a clone for the query loop.
         // Callers typically wrap the registry in an Arc already.
-        let provider_options = cfg
-            .provider
-            .as_deref()
-            .and_then(|provider| cfg.provider_configs.get(provider))
-            .map(|provider_cfg| provider_cfg.options.clone())
-            .unwrap_or_default();
+        let provider_options = Self::provider_options_for_config(cfg);
         Self {
             model: claurst_api::effective_model_for_config(cfg, registry),
             max_tokens: cfg.effective_max_tokens(),
@@ -651,14 +651,29 @@ fn resolve_bedrock_kb_auto_retrieve_config(
     tool_ctx: &ToolContext,
     config: &QueryConfig,
 ) -> Result<Option<BedrockKbAutoRetrieveConfig>, String> {
-    if tool_ctx.config.provider.as_deref() != Some("amazon-bedrock") {
-        return Ok(None);
-    }
-
-    let Some(retrieval_options) = config.provider_options.get("knowledgeBaseRetrieval") else {
+    let amazon_bedrock_options = tool_ctx
+        .config
+        .provider_configs
+        .get("amazon-bedrock")
+        .map(|provider| &provider.options);
+    let active_provider_is_bedrock = matches!(
+        tool_ctx.config.provider.as_deref(),
+        Some("amazon-bedrock" | "bedrock-mantle")
+    );
+    let retrieval_options_value = config
+        .provider_options
+        .get("knowledgeBaseRetrieval")
+        .or_else(|| {
+            if active_provider_is_bedrock {
+                amazon_bedrock_options.and_then(|options| options.get("knowledgeBaseRetrieval"))
+            } else {
+                None
+            }
+        });
+    let Some(retrieval_options_value) = retrieval_options_value else {
         return Ok(None);
     };
-    let Some(retrieval_options) = retrieval_options.as_object() else {
+    let Some(retrieval_options) = retrieval_options_value.as_object() else {
         return Err("knowledgeBaseRetrieval must be an object".to_string());
     };
     if !retrieval_options
@@ -670,7 +685,12 @@ fn resolve_bedrock_kb_auto_retrieve_config(
         return Ok(None);
     }
 
-    let configured = configured_bedrock_knowledge_bases(&config.provider_options);
+    let mut configured = configured_bedrock_knowledge_bases(&config.provider_options);
+    if configured.is_empty() {
+        if let Some(options) = amazon_bedrock_options {
+            configured = configured_bedrock_knowledge_bases(options);
+        }
+    }
     let requested = retrieval_options
         .get("knowledgeBase")
         .or_else(|| retrieval_options.get("knowledge_base"))
@@ -683,6 +703,14 @@ fn resolve_bedrock_kb_auto_retrieve_config(
                 .get("defaultKnowledgeBase")
                 .or_else(|| config.provider_options.get("default_knowledge_base"))
                 .and_then(Value::as_str)
+                .or_else(|| {
+                    amazon_bedrock_options.and_then(|options| {
+                        options
+                            .get("defaultKnowledgeBase")
+                            .or_else(|| options.get("default_knowledge_base"))
+                            .and_then(Value::as_str)
+                    })
+                })
         });
 
     let selected = select_bedrock_knowledge_base_for_query(requested, &configured)?;

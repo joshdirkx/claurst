@@ -2331,6 +2331,8 @@ async fn run_interactive(
                                                         &cmd_ctx.config,
                                                         refreshed.model_registry.as_ref(),
                                                     );
+                                                base_query_config.provider_options =
+                                                    claurst_query::QueryConfig::provider_options_for_config(&cmd_ctx.config);
                                                 client = refreshed.client;
                                                 model_registry = refreshed.model_registry;
                                                 session.model =
@@ -2744,6 +2746,8 @@ async fn run_interactive(
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        qcfg.provider_options =
+                            claurst_query::QueryConfig::provider_options_for_config(&cmd_ctx.config);
                         qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
@@ -3113,6 +3117,8 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                qcfg.provider_options =
+                    claurst_query::QueryConfig::provider_options_for_config(&cmd_ctx.config);
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -3267,6 +3273,8 @@ async fn run_interactive(
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        qcfg.provider_options =
+                            claurst_query::QueryConfig::provider_options_for_config(&cmd_ctx.config);
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -3375,6 +3383,8 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                qcfg.provider_options =
+                    claurst_query::QueryConfig::provider_options_for_config(&cmd_ctx.config);
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -3799,6 +3809,8 @@ async fn run_interactive(
                             let mut qcfg = base_query_config.clone();
                             qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                             qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                            qcfg.provider_options =
+                                claurst_query::QueryConfig::provider_options_for_config(&cmd_ctx.config);
                             qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                             qcfg.system_prompt = base_query_config.system_prompt.clone();
                             qcfg.output_style = cmd_ctx.config.effective_output_style();
