@@ -2806,6 +2806,7 @@ async fn run_interactive(
                             let tool_use_id = pr.tool_use_id.clone();
                             let selected_option = pr.selected_option;
                             let selected_key = pr.options.get(selected_option).map(|o| o.key);
+                            let selected_label = pr.options.get(selected_option).map(|o| o.label.clone());
                             let should_record_bash_prefix = selected_key == Some('P');
                             let selected_path = pending_permissions
                                 .lock()
@@ -2823,6 +2824,16 @@ async fn run_interactive(
                             } else {
                                 None
                             };
+                            let timeline_status = if selected_key == Some('n') {
+                                claurst_tui::app::TimelineEventStatus::Denied
+                            } else {
+                                claurst_tui::app::TimelineEventStatus::Approved
+                            };
+                            app.record_permission_resolution(
+                                &tool_use_id,
+                                timeline_status,
+                                selected_label,
+                            );
                             app.permission_request = None;
 
                             if let Some(prefix) = bash_prefix {
@@ -2972,7 +2983,9 @@ async fn run_interactive(
                 match reevaluated {
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
                         let tool_use_id = pending.tool_use_id.clone();
-                        app.permission_request = Some(permission_request_from_core(&pending));
+                        let permission_request = permission_request_from_core(&pending);
+                        app.record_permission_prompt(&permission_request);
+                        app.permission_request = Some(permission_request);
                         pending_permissions.lock().waiting.insert(tool_use_id, pending);
                         break;
                     }
@@ -3446,20 +3459,25 @@ async fn run_interactive(
         // When the AskUserQuestion tool fires, it sends a UserQuestionEvent
         // here.  We open the dialog and the user's answer travels back via
         // the embedded oneshot channel.
-        if let Some(ref mut rx) = app.user_question_rx {
+        let user_question_event = if let Some(ref mut rx) = app.user_question_rx {
             match rx.try_recv() {
-                Ok(event) => {
-                    app.ask_user_dialog.open(
-                        event.question,
-                        event.options,
-                        event.reply_tx,
-                    );
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Ok(event) => Some(event),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     app.user_question_rx = None;
+                    None
                 }
             }
+        } else {
+            None
+        };
+        if let Some(event) = user_question_event {
+            app.record_ask_user_prompt(&event.question, event.options.as_ref());
+            app.ask_user_dialog.open(
+                event.question,
+                event.options,
+                event.reply_tx,
+            );
         }
 
         // Spawn async provider model-list fetch when requested.

@@ -556,6 +556,28 @@ mod tests {
     }
 
     #[test]
+    fn test_ask_user_timeline_records_answer() {
+        let mut app = make_app();
+        let options = vec!["Run cargo test".to_string()];
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+
+        app.record_ask_user_prompt("How should tests run?", Some(&options));
+        app.ask_user_dialog.open(
+            "How should tests run?".to_string(),
+            Some(options),
+            tx,
+        );
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.timeline_events.len(), 1);
+        assert_eq!(app.timeline_events[0].status, app::TimelineEventStatus::Answered);
+        assert_eq!(
+            app.timeline_events[0].selected.as_deref(),
+            Some("Run cargo test")
+        );
+    }
+
+    #[test]
     fn test_ctrl_c_requires_two_presses_to_exit() {
         let mut app = make_app();
         // First Ctrl+C: shows warning, doesn't exit

@@ -1,4 +1,4 @@
-use crate::app::{App, ToolStatus, ToolUseBlock, TurnMetadata};
+use crate::app::{App, TimelineEvent, ToolStatus, ToolUseBlock, TurnMetadata};
 use claurst_core::types::{ContentBlock, Message, Role};
 
 #[derive(Debug)]
@@ -10,6 +10,7 @@ pub struct TranscriptTurn<'a> {
     pub assistant_messages: Vec<(usize, &'a Message)>,
     pub tool_result_messages: Vec<(usize, &'a Message)>,
     pub tool_blocks: Vec<&'a ToolUseBlock>,
+    pub timeline_events: Vec<&'a TimelineEvent>,
     pub live_blocks: Vec<ContentBlock>,
     pub live_text: Option<&'a str>,
     pub live_thinking: Option<&'a str>,
@@ -30,6 +31,7 @@ impl<'a> TranscriptTurn<'a> {
         !self.assistant_messages.is_empty()
             || !self.tool_result_messages.is_empty()
             || !self.tool_blocks.is_empty()
+            || !self.timeline_events.is_empty()
             || !self.live_blocks.is_empty()
             || self.live_text.is_some()
             || self.live_thinking.is_some()
@@ -165,6 +167,7 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
                     .filter_map(|index| app.messages.get(index).map(|message| (index, message)))
                     .collect(),
                 tool_blocks: Vec::new(),
+                timeline_events: Vec::new(),
                 live_blocks: Vec::new(),
                 live_text: None,
                 live_thinking: None,
@@ -185,6 +188,20 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
 
         if let Some(last) = turns.last_mut() {
             last.tool_blocks.push(block);
+        }
+    }
+
+    for event in &app.timeline_events {
+        if let Some(target) = event
+            .turn_index
+            .and_then(|ordinal| turns.iter_mut().find(|turn| turn.ordinal == ordinal))
+        {
+            target.timeline_events.push(event);
+            continue;
+        }
+
+        if let Some(last) = turns.last_mut() {
+            last.timeline_events.push(event);
         }
     }
 

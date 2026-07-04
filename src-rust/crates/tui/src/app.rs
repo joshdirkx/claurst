@@ -430,6 +430,45 @@ pub struct ToolUseBlock {
     pub input_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineEventStatus {
+    Pending,
+    Approved,
+    Denied,
+    Cancelled,
+    Answered,
+    Submitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineEventKind {
+    Permission,
+    AskUser,
+    McpApproval,
+    Elicitation,
+}
+
+/// Non-message transcript event shown inline with the current turn.
+///
+/// Approval prompts are intentionally kept as TUI state rather than appended to
+/// `messages`: they document what the human saw and chose without changing the
+/// conversation sent back to the model.
+#[derive(Debug, Clone)]
+pub struct TimelineEvent {
+    pub id: u64,
+    pub sequence: u64,
+    pub turn_index: Option<usize>,
+    pub kind: TimelineEventKind,
+    pub related_tool_id: Option<String>,
+    pub title: String,
+    pub subject: String,
+    pub prompt: String,
+    pub preview: Option<String>,
+    pub options: Vec<String>,
+    pub selected: Option<String>,
+    pub status: TimelineEventStatus,
+}
+
 #[derive(Debug, Clone)]
 enum StreamingPartialBlock {
     Text(String),
@@ -923,6 +962,12 @@ pub struct App {
 
     // Extended state
     pub tool_use_blocks: Vec<ToolUseBlock>,
+    pub timeline_events: Vec<TimelineEvent>,
+    timeline_next_id: u64,
+    permission_timeline_events: std::collections::HashMap<String, u64>,
+    ask_user_timeline_event_id: Option<u64>,
+    mcp_approval_timeline_event_id: Option<u64>,
+    elicitation_timeline_event_id: Option<u64>,
     pub permission_request: Option<PermissionRequest>,
     pub frame_count: u64,
     pub token_count: u32,
@@ -1434,6 +1479,12 @@ impl App {
             show_help: false,
             kitty_keyboard_active: true,
             tool_use_blocks: Vec::new(),
+            timeline_events: Vec::new(),
+            timeline_next_id: 1,
+            permission_timeline_events: std::collections::HashMap::new(),
+            ask_user_timeline_event_id: None,
+            mcp_approval_timeline_event_id: None,
+            elicitation_timeline_event_id: None,
             permission_request: None,
             frame_count: 0,
             token_count: 0,
@@ -1743,6 +1794,206 @@ impl App {
             .filter(|msg| msg.role == Role::User)
             .count()
             .checked_sub(1)
+    }
+
+    fn next_timeline_event_id(&mut self) -> u64 {
+        let id = self.timeline_next_id;
+        self.timeline_next_id = self.timeline_next_id.saturating_add(1);
+        id
+    }
+
+    fn truncate_timeline_text(text: impl AsRef<str>) -> String {
+        let collapsed = text
+            .as_ref()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut chars = collapsed.chars();
+        let preview: String = chars.by_ref().take(160).collect();
+        if chars.next().is_some() {
+            format!("{preview}...")
+        } else {
+            preview
+        }
+    }
+
+    fn current_or_latest_turn_index(&self) -> Option<usize> {
+        self.current_user_turn_index().or_else(|| {
+            if self.messages.is_empty() {
+                None
+            } else {
+                Some(0)
+            }
+        })
+    }
+
+    fn push_timeline_event(
+        &mut self,
+        kind: TimelineEventKind,
+        related_tool_id: Option<String>,
+        title: impl Into<String>,
+        subject: impl Into<String>,
+        prompt: impl Into<String>,
+        preview: Option<String>,
+        options: Vec<String>,
+    ) -> u64 {
+        let id = self.next_timeline_event_id();
+        self.timeline_events.push(TimelineEvent {
+            id,
+            sequence: id,
+            turn_index: self.current_or_latest_turn_index(),
+            kind,
+            related_tool_id,
+            title: title.into(),
+            subject: subject.into(),
+            prompt: Self::truncate_timeline_text(prompt.into()),
+            preview: preview.map(Self::truncate_timeline_text),
+            options,
+            selected: None,
+            status: TimelineEventStatus::Pending,
+        });
+        self.invalidate_transcript();
+        id
+    }
+
+    fn resolve_timeline_event(
+        &mut self,
+        id: u64,
+        status: TimelineEventStatus,
+        selected: Option<String>,
+    ) {
+        if let Some(event) = self.timeline_events.iter_mut().find(|event| event.id == id) {
+            event.status = status;
+            event.selected = selected.map(Self::truncate_timeline_text);
+            self.invalidate_transcript();
+        }
+    }
+
+    pub fn record_permission_prompt(&mut self, pr: &PermissionRequest) {
+        let preview = pr.input_preview.clone().filter(|text| !text.trim().is_empty());
+        let prompt = if pr.description.trim().is_empty() {
+            pr.danger_explanation.clone()
+        } else if pr.danger_explanation.trim().is_empty() {
+            pr.description.clone()
+        } else {
+            format!("{} {}", pr.description, pr.danger_explanation)
+        };
+        let id = self.push_timeline_event(
+            TimelineEventKind::Permission,
+            Some(pr.tool_use_id.clone()),
+            "Approval requested",
+            pr.tool_name.clone(),
+            prompt,
+            preview,
+            pr.options.iter().map(|option| option.label.clone()).collect(),
+        );
+        self.permission_timeline_events
+            .insert(pr.tool_use_id.clone(), id);
+    }
+
+    pub fn record_permission_resolution(
+        &mut self,
+        tool_use_id: &str,
+        status: TimelineEventStatus,
+        selected: Option<String>,
+    ) {
+        if let Some(id) = self.permission_timeline_events.remove(tool_use_id) {
+            self.resolve_timeline_event(id, status, selected);
+        }
+    }
+
+    pub fn record_ask_user_prompt(&mut self, question: &str, options: Option<&Vec<String>>) {
+        let id = self.push_timeline_event(
+            TimelineEventKind::AskUser,
+            None,
+            "Question asked",
+            "AskUserQuestion",
+            question,
+            None,
+            options.cloned().unwrap_or_default(),
+        );
+        self.ask_user_timeline_event_id = Some(id);
+    }
+
+    fn resolve_ask_user_timeline(&mut self, status: TimelineEventStatus, selected: Option<String>) {
+        if let Some(id) = self.ask_user_timeline_event_id.take() {
+            self.resolve_timeline_event(id, status, selected);
+        }
+    }
+
+    fn current_ask_user_answer(&self) -> String {
+        if self.ask_user_dialog.in_custom_input || self.ask_user_dialog.options.is_none() {
+            self.ask_user_dialog.custom_text.clone()
+        } else {
+            self.ask_user_dialog
+                .options
+                .as_ref()
+                .and_then(|options| options.get(self.ask_user_dialog.selected_idx))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn mcp_choice_label(choice: &crate::dialogs::McpApprovalChoice) -> &'static str {
+        match choice {
+            crate::dialogs::McpApprovalChoice::AllowSession => "Allow this session",
+            crate::dialogs::McpApprovalChoice::AllowAlways => "Always allow",
+            crate::dialogs::McpApprovalChoice::Deny => "Deny",
+        }
+    }
+
+    fn resolve_mcp_approval_timeline(&mut self, choice: &crate::dialogs::McpApprovalChoice) {
+        if let Some(id) = self.mcp_approval_timeline_event_id.take() {
+            let status = match choice {
+                crate::dialogs::McpApprovalChoice::Deny => TimelineEventStatus::Denied,
+                _ => TimelineEventStatus::Approved,
+            };
+            self.resolve_timeline_event(
+                id,
+                status,
+                Some(Self::mcp_choice_label(choice).to_string()),
+            );
+        }
+    }
+
+    pub fn show_elicitation_with_timeline(
+        &mut self,
+        server_name: impl Into<String>,
+        message: Option<impl Into<String>>,
+        fields: Vec<crate::elicitation_dialog::ElicitationField>,
+    ) {
+        let server_name = server_name.into();
+        let message = message.map(|m| m.into());
+        let options = fields.iter().map(|field| field.title.clone()).collect();
+        let prompt = message
+            .clone()
+            .unwrap_or_else(|| "MCP server requested input".to_string());
+        let id = self.push_timeline_event(
+            TimelineEventKind::Elicitation,
+            None,
+            "Input requested",
+            server_name.clone(),
+            prompt,
+            None,
+            options,
+        );
+        self.elicitation_timeline_event_id = Some(id);
+        self.elicitation.show(server_name, message, fields);
+    }
+
+    fn summarize_elicitation_values(&self) -> String {
+        let count = self.elicitation.fields.len();
+        if count == 0 {
+            "submitted".to_string()
+        } else {
+            format!("submitted {} field{}", count, if count == 1 { "" } else { "s" })
+        }
+    }
+
+    fn resolve_elicitation_timeline(&mut self, status: TimelineEventStatus, selected: Option<String>) {
+        if let Some(id) = self.elicitation_timeline_event_id.take() {
+            self.resolve_timeline_event(id, status, selected);
+        }
     }
 
     fn current_agent_mode_snapshot(&self) -> String {
@@ -2356,6 +2607,11 @@ impl App {
                 self.display_messages.clear();
                 self.clear_streaming_content();
                 self.tool_use_blocks.clear();
+                self.timeline_events.clear();
+                self.permission_timeline_events.clear();
+                self.ask_user_timeline_event_id = None;
+                self.mcp_approval_timeline_event_id = None;
+                self.elicitation_timeline_event_id = None;
                 self.turn_metadata.clear();
                 self.cost_usd = 0.0;
                 self.invalidate_transcript();
@@ -3085,6 +3341,11 @@ impl App {
             return false;
         }
         if let Some(server) = self.mcp_pending_project.pop_front() {
+            let preview = server
+                .command
+                .clone()
+                .or_else(|| server.url.clone())
+                .filter(|text| !text.trim().is_empty());
             self.mcp_approval.show(
                 &server.name,
                 server.url.as_deref(),
@@ -3093,6 +3354,20 @@ impl App {
                 // shows the command/url so the user can judge before running it.
                 Vec::new(),
             );
+            let id = self.push_timeline_event(
+                TimelineEventKind::McpApproval,
+                None,
+                "MCP approval requested",
+                server.name.clone(),
+                "Project-defined MCP server requested approval",
+                preview,
+                vec![
+                    "Allow this session".to_string(),
+                    "Always allow".to_string(),
+                    "Deny".to_string(),
+                ],
+            );
+            self.mcp_approval_timeline_event_id = Some(id);
             self.mcp_prompting = Some(server);
             true
         } else {
@@ -3109,6 +3384,7 @@ impl App {
             Some(s) => s,
             None => return,
         };
+        self.resolve_mcp_approval_timeline(&choice);
         match choice {
             McpApprovalChoice::AllowSession => {
                 self.mcp_session_trusted
@@ -3478,9 +3754,22 @@ impl App {
         if self.ask_user_dialog.visible {
             match key.code {
                 KeyCode::Esc => {
+                    self.resolve_ask_user_timeline(
+                        TimelineEventStatus::Cancelled,
+                        Some("Dismissed".to_string()),
+                    );
                     self.ask_user_dialog.dismiss();
                 }
                 KeyCode::Enter => {
+                    let answer = self.current_ask_user_answer();
+                    self.resolve_ask_user_timeline(
+                        TimelineEventStatus::Answered,
+                        if answer.trim().is_empty() {
+                            Some("Dismissed".to_string())
+                        } else {
+                            Some(answer)
+                        },
+                    );
                     self.ask_user_dialog.confirm();
                 }
                 KeyCode::Up | KeyCode::BackTab => {
@@ -4196,11 +4485,21 @@ impl App {
         if self.elicitation.visible {
             match key.code {
                 KeyCode::Esc => {
+                    self.resolve_elicitation_timeline(
+                        TimelineEventStatus::Cancelled,
+                        Some("Cancelled".to_string()),
+                    );
                     self.elicitation.cancel();
                     return false;
                 }
                 KeyCode::Enter => {
-                    self.elicitation.submit();
+                    if self.elicitation.submit() {
+                        let summary = self.summarize_elicitation_values();
+                        self.resolve_elicitation_timeline(
+                            TimelineEventStatus::Submitted,
+                            Some(summary),
+                        );
+                    }
                     return false;
                 }
                 KeyCode::Tab | KeyCode::Down => {
@@ -5517,6 +5816,23 @@ impl App {
                         pr.selected_option = idx;
                         // If this is the prefix-allow option ('P'), record the prefix.
                         self.maybe_record_bash_prefix();
+                        let selected = self
+                            .permission_request
+                            .as_ref()
+                            .and_then(|pr| pr.options.get(pr.selected_option))
+                            .map(|option| option.label.clone());
+                        let status = if c == 'n' {
+                            TimelineEventStatus::Denied
+                        } else {
+                            TimelineEventStatus::Approved
+                        };
+                        if let Some(tool_use_id) = self
+                            .permission_request
+                            .as_ref()
+                            .map(|pr| pr.tool_use_id.clone())
+                        {
+                            self.record_permission_resolution(&tool_use_id, status, selected);
+                        }
                         self.permission_request = None;
                         return;
                     }
@@ -5525,6 +5841,23 @@ impl App {
             KeyCode::Enter => {
                 // If the currently selected option is the prefix-allow option, record it.
                 self.maybe_record_bash_prefix();
+                let selected = self
+                    .permission_request
+                    .as_ref()
+                    .and_then(|pr| pr.options.get(pr.selected_option))
+                    .map(|option| option.label.clone());
+                let status = if selected.as_deref().is_some_and(|label| label.contains("deny")) {
+                    TimelineEventStatus::Denied
+                } else {
+                    TimelineEventStatus::Approved
+                };
+                if let Some(tool_use_id) = self
+                    .permission_request
+                    .as_ref()
+                    .map(|pr| pr.tool_use_id.clone())
+                {
+                    self.record_permission_resolution(&tool_use_id, status, selected);
+                }
                 self.permission_request = None;
             }
             KeyCode::Up => {
@@ -5540,6 +5873,17 @@ impl App {
                 }
             }
             KeyCode::Esc => {
+                if let Some(tool_use_id) = self
+                    .permission_request
+                    .as_ref()
+                    .map(|pr| pr.tool_use_id.clone())
+                {
+                    self.record_permission_resolution(
+                        &tool_use_id,
+                        TimelineEventStatus::Cancelled,
+                        Some("Cancelled".to_string()),
+                    );
+                }
                 self.permission_request = None;
             }
             _ => {}

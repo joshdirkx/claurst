@@ -5,7 +5,10 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus, ToolUseBlock};
+use crate::app::{
+    App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, TimelineEvent, TimelineEventKind,
+    TimelineEventStatus, ToolStatus, ToolUseBlock,
+};
 use crate::rustle::rustle_lines;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -381,6 +384,7 @@ struct MessageLinesCacheKey {
     messages_len: usize,
     annotations_ptr: usize,
     annotations_len: usize,
+    timeline_len: usize,
     thinking_expanded_len: usize,
 }
 
@@ -397,6 +401,7 @@ struct CompletedMsgCacheKey {
     transcript_version: u64,
     messages_len: usize,
     annotations_len: usize,
+    timeline_len: usize,
     thinking_expanded_len: usize,
 }
 
@@ -1189,35 +1194,28 @@ fn push_blank_item(items: &mut Vec<RenderedLineItem>) {
 
 fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width: u16) -> Vec<Line<'static>> {
     let thinking_accent = Color::Rgb(85, 190, 205);
-    let thinking_bg = Color::Rgb(15, 29, 34);
     let mut header_spans = vec![
-        Span::styled("  │ ", Style::default().fg(thinking_accent).bg(thinking_bg)),
+        Span::styled("  │ ", Style::default().fg(thinking_accent)),
         Span::styled(
-            " THINKING ",
+            " thinking ",
             Style::default()
-                .fg(Color::Black)
-                .bg(thinking_accent)
+                .fg(thinking_accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             " ▼ ",
             Style::default()
                 .fg(thinking_accent)
-                .bg(thinking_bg)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    let mut shimmer = shimmer_spans("Thinking", frame_count);
-    for span in &mut shimmer {
-        span.style = span.style.bg(thinking_bg);
-    }
+    let shimmer = shimmer_spans("Thinking", frame_count);
     header_spans.extend(shimmer);
     if let Some(heading) = turn.reasoning_heading() {
         header_spans.push(Span::styled(
             format!("  {}", heading),
             Style::default()
                 .fg(Color::Rgb(176, 204, 210))
-                .bg(thinking_bg)
                 .add_modifier(Modifier::ITALIC),
         ));
     }
@@ -1228,7 +1226,7 @@ fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width
     if used < width as usize {
         header_spans.push(Span::styled(
             " ".repeat(width as usize - used),
-            Style::default().bg(thinking_bg),
+            Style::default(),
         ));
     }
     let mut lines = vec![Line::from(header_spans)];
@@ -1301,6 +1299,62 @@ fn message_tool_result_ids(message: &Message) -> std::collections::HashSet<Strin
         .collect()
 }
 
+fn render_timeline_event_lines(event: &TimelineEvent, width: u16) -> Vec<Line<'static>> {
+    let (marker, accent, status_label) = match event.status {
+        TimelineEventStatus::Pending => ("?", Color::Yellow, "pending"),
+        TimelineEventStatus::Approved => ("✓", Color::Green, "approved"),
+        TimelineEventStatus::Denied => ("×", Color::Red, "denied"),
+        TimelineEventStatus::Cancelled => ("↩", Color::DarkGray, "cancelled"),
+        TimelineEventStatus::Answered => ("→", Color::Cyan, "answered"),
+        TimelineEventStatus::Submitted => ("→", Color::Cyan, "submitted"),
+    };
+    let kind_label = match event.kind {
+        TimelineEventKind::Permission => "approval",
+        TimelineEventKind::AskUser => "question",
+        TimelineEventKind::McpApproval => "mcp",
+        TimelineEventKind::Elicitation => "input",
+    };
+    let mut lines = Vec::new();
+    let subject = if event.subject.is_empty() {
+        event.title.clone()
+    } else {
+        format!("{} · {}", event.title, event.subject)
+    };
+    let selected = event
+        .selected
+        .as_ref()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| format!(" · {}", text))
+        .unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled("  │ ", Style::default().fg(accent)),
+        Span::styled(marker.to_string(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(kind_label.to_string(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {status_label}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(selected, Style::default().fg(Color::Gray)),
+        Span::styled(format!("  {}", subject), Style::default().fg(Color::Gray)),
+    ]));
+
+    for text in [&event.prompt, event.preview.as_deref().unwrap_or("")]
+        .into_iter()
+        .filter(|text| !text.trim().is_empty())
+    {
+        let clipped = if text.chars().count() > width.saturating_sub(8) as usize {
+            let clipped: String = text.chars().take(width.saturating_sub(11) as usize).collect();
+            format!("{clipped}...")
+        } else {
+            text.to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  │   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(clipped, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    lines
+}
+
 fn append_turn_items(
     items: &mut Vec<RenderedLineItem>,
     turn: &TranscriptTurn<'_>,
@@ -1324,6 +1378,9 @@ fn append_turn_items(
 
     let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
     let mut rendered_tool_ids = std::collections::HashSet::new();
+    let mut rendered_timeline_ids = std::collections::HashSet::new();
+    let mut timeline_events = turn.timeline_events.clone();
+    timeline_events.sort_by_key(|event| event.sequence);
     let has_ordered_tool_use_blocks = turn.assistant_messages.iter().any(|(_, message)| {
         message
             .content_blocks()
@@ -1341,6 +1398,16 @@ fn append_turn_items(
             if !lines.is_empty() {
                 rendered_tool_ids.insert(block.id.clone());
                 sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
+                for event in timeline_events
+                    .iter()
+                    .filter(|event| event.related_tool_id.as_deref() == Some(block.id.as_str()))
+                {
+                    rendered_timeline_ids.insert(event.id);
+                    sections.push((
+                        SectionContent::Plain(render_timeline_event_lines(event, width)),
+                        Some(turn.primary_message_index()),
+                    ));
+                }
             }
         }
     }
@@ -1365,6 +1432,7 @@ fn append_turn_items(
         TurnEvent::Assistant(index, _) | TurnEvent::ToolResult(index, _) => *index,
     });
 
+    let mut inserted_unrelated_timeline_events = false;
     for event in ordered_events {
         match event {
             TurnEvent::Assistant(message_index, message) => {
@@ -1377,9 +1445,19 @@ fn append_turn_items(
                         turn.active,
                         frame_count,
                     ) {
-                        rendered_tool_ids.insert(tool_id);
+                        rendered_tool_ids.insert(tool_id.clone());
                         if !tool_lines.is_empty() {
                             sections.push((SectionContent::Plain(tool_lines), Some(message_index)));
+                        }
+                        for event in timeline_events
+                            .iter()
+                            .filter(|event| event.related_tool_id.as_deref() == Some(tool_id.as_str()))
+                        {
+                            rendered_timeline_ids.insert(event.id);
+                            sections.push((
+                                SectionContent::Plain(render_timeline_event_lines(event, width)),
+                                Some(message_index),
+                            ));
                         }
                         continue;
                     }
@@ -1392,6 +1470,19 @@ fn append_turn_items(
                     );
                     if !tagged.is_empty() {
                         sections.push((SectionContent::Tagged(tagged), Some(message_index)));
+                    }
+                }
+                if !inserted_unrelated_timeline_events {
+                    inserted_unrelated_timeline_events = true;
+                    for event in timeline_events
+                        .iter()
+                        .filter(|event| event.related_tool_id.is_none())
+                    {
+                        rendered_timeline_ids.insert(event.id);
+                        sections.push((
+                            SectionContent::Plain(render_timeline_event_lines(event, width)),
+                            Some(message_index),
+                        ));
                     }
                 }
             }
@@ -1435,9 +1526,19 @@ fn append_turn_items(
             turn.active,
             frame_count,
         ) {
-            rendered_tool_ids.insert(tool_id);
+            rendered_tool_ids.insert(tool_id.clone());
             if !tool_lines.is_empty() {
                 sections.push((SectionContent::Plain(tool_lines), Some(turn.primary_message_index())));
+            }
+            for event in timeline_events
+                .iter()
+                .filter(|event| event.related_tool_id.as_deref() == Some(tool_id.as_str()))
+            {
+                rendered_timeline_ids.insert(event.id);
+                sections.push((
+                    SectionContent::Plain(render_timeline_event_lines(event, width)),
+                    Some(turn.primary_message_index()),
+                ));
             }
             continue;
         }
@@ -1462,6 +1563,26 @@ fn append_turn_items(
         if !lines.is_empty() {
             sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
         }
+        for event in timeline_events
+            .iter()
+            .filter(|event| event.related_tool_id.as_deref() == Some(block.id.as_str()))
+        {
+            rendered_timeline_ids.insert(event.id);
+            sections.push((
+                SectionContent::Plain(render_timeline_event_lines(event, width)),
+                Some(turn.primary_message_index()),
+            ));
+        }
+    }
+
+    for event in timeline_events
+        .iter()
+        .filter(|event| !rendered_timeline_ids.contains(&event.id))
+    {
+        sections.push((
+            SectionContent::Plain(render_timeline_event_lines(event, width)),
+            Some(turn.primary_message_index()),
+        ));
     }
 
     if turn.active && turn.live_thinking.is_some() {
@@ -1536,6 +1657,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         messages_len: app.messages.len(),
         annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
+        timeline_len: app.timeline_events.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
     if cacheable {
@@ -1555,6 +1677,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         transcript_version: app.transcript_version.get(),
         messages_len: app.messages.len(),
         annotations_len: app.system_annotations.len(),
+        timeline_len: app.timeline_events.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
     let build_items = || {
@@ -1616,6 +1739,20 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 let mut lines = Vec::new();
                 render_tool_block_lines(&mut lines, block, app.frame_count);
                 push_rendered_items(&mut items, lines, None, false);
+                push_blank_item(&mut items);
+            }
+        }
+
+        if total == 0 && !app.timeline_events.is_empty() {
+            let mut events = app.timeline_events.iter().collect::<Vec<_>>();
+            events.sort_by_key(|event| event.sequence);
+            for event in events {
+                push_rendered_items(
+                    &mut items,
+                    render_timeline_event_lines(event, width),
+                    None,
+                    false,
+                );
                 push_blank_item(&mut items);
             }
         }
@@ -3525,5 +3662,56 @@ mod tool_block_tests {
             first_text_pos < tool_pos && tool_pos < final_pos,
             "rendered order was {rendered:?}"
         );
+    }
+
+    #[test]
+    fn turn_renders_permission_timeline_before_final_text() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.messages.push(Message::user("please inspect the repo"));
+        app.messages.push(Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "tool-1".to_string(),
+            name: "Read".to_string(),
+            input: serde_json::json!({ "file_path": "README.md" }),
+        }]));
+        let permission = crate::dialogs::PermissionRequest::file_read(
+            "tool-1".to_string(),
+            "Read".to_string(),
+            "Read README.md".to_string(),
+            "README.md".to_string(),
+        );
+        app.record_permission_prompt(&permission);
+        app.record_permission_resolution(
+            "tool-1",
+            TimelineEventStatus::Approved,
+            Some("Yes, allow once".to_string()),
+        );
+        app.messages
+            .push(Message::assistant("final response after approval"));
+
+        let turns = build_transcript_turns(&app);
+        let mut items = Vec::new();
+        append_turn_items(
+            &mut items,
+            &turns[0],
+            100,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            0,
+            Color::White,
+        );
+        let rendered = items
+            .iter()
+            .map(|item| item.search_text.as_str())
+            .collect::<Vec<_>>();
+        let approval_pos = rendered
+            .iter()
+            .position(|line| line.contains("approval approved"))
+            .expect("approval timeline should render");
+        let final_pos = rendered
+            .iter()
+            .position(|line| line.contains("final response after approval"))
+            .expect("assistant text should render");
+
+        assert!(approval_pos < final_pos, "rendered order was {rendered:?}");
     }
 }

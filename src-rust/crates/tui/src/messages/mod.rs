@@ -67,7 +67,6 @@ const TRANSCRIPT_CHIP_BG: Color = Color::Rgb(31, 31, 41);
 const TRANSCRIPT_TEXT: Color = Color::Rgb(236, 236, 241);
 const TRANSCRIPT_MUTED: Color = Color::Rgb(139, 139, 153);
 const THINKING_ACCENT: Color = Color::Rgb(85, 190, 205);
-const THINKING_BG: Color = Color::Rgb(15, 29, 34);
 const THINKING_TEXT: Color = Color::Rgb(176, 204, 210);
 const THINKING_MUTED: Color = Color::Rgb(113, 151, 160);
 
@@ -548,22 +547,19 @@ pub fn render_transcript_reasoning_block(
             Span::styled(
                 " THINKING ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(THINKING_ACCENT)
+                    .fg(THINKING_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {} ", chevron),
                 Style::default()
                     .fg(THINKING_ACCENT)
-                    .bg(THINKING_BG)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 heading,
                 Style::default()
                     .fg(THINKING_TEXT)
-                    .bg(THINKING_BG)
                     .add_modifier(Modifier::ITALIC),
             ),
         ]),
@@ -599,11 +595,10 @@ fn apply_thinking_block_style(mut line: Line<'static>, width: u16) -> Line<'stat
         if span.style.fg.is_none() {
             span.style = span.style.fg(THINKING_TEXT);
         }
-        span.style = span.style.bg(THINKING_BG);
     }
 
     let mut spans = vec![
-        Span::styled("  │ ", Style::default().fg(THINKING_ACCENT).bg(THINKING_BG)),
+        Span::styled("  │ ", Style::default().fg(THINKING_ACCENT)),
     ];
     spans.extend(line.spans);
 
@@ -611,7 +606,7 @@ fn apply_thinking_block_style(mut line: Line<'static>, width: u16) -> Line<'stat
     if used < width as usize {
         spans.push(Span::styled(
             " ".repeat(width as usize - used),
-            Style::default().fg(THINKING_MUTED).bg(THINKING_BG),
+            Style::default().fg(THINKING_MUTED),
         ));
     }
 
@@ -2127,6 +2122,17 @@ mod tests {
         assert!(expanded.contains("THINKING"));
         assert!(expanded.contains("inspect files"));
         assert!(expanded_lines.len() > collapsed_lines.len());
+    }
+
+    #[test]
+    fn reasoning_block_uses_plain_background() {
+        let lines = render_transcript_reasoning_block("inspect files", true, 80);
+
+        for line in lines {
+            for span in line.spans {
+                assert!(span.style.bg.is_none(), "thinking span should not set bg");
+            }
+        }
     }
 
     #[test]
