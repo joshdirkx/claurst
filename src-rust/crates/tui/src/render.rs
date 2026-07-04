@@ -1229,6 +1229,18 @@ fn append_turn_items(
     }
 
     let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
+    // Tool events are emitted after the model's tool-use message is parsed but
+    // before the follow-up assistant answer. Claurst stores the visible tool
+    // cards separately from assistant messages, so render them before the
+    // assistant text to preserve the visible operation order.
+    for block in &turn.tool_blocks {
+        let mut lines = Vec::new();
+        render_tool_block_lines(&mut lines, block, frame_count);
+        if !lines.is_empty() {
+            sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
+        }
+    }
+
     for (message_index, message) in &turn.assistant_messages {
         let tagged = render_transcript_assistant_message_tagged(
             message,
@@ -1242,14 +1254,6 @@ fn append_turn_items(
         );
         if !tagged.is_empty() {
             sections.push((SectionContent::Tagged(tagged), Some(*message_index)));
-        }
-    }
-
-    for block in &turn.tool_blocks {
-        let mut lines = Vec::new();
-        render_tool_block_lines(&mut lines, block, frame_count);
-        if !lines.is_empty() {
-            sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
         }
     }
 
@@ -1662,6 +1666,20 @@ fn tool_icon(normalized: &str) -> &'static str {
         "task" | "agent" => "+",
         _ => "~",
     }
+}
+
+fn format_context_counter(used_tokens: u64, window_tokens: u64) -> String {
+    let used_display = if used_tokens < 1000 {
+        used_tokens.to_string()
+    } else {
+        format!("{}k", used_tokens / 1000)
+    };
+    let total_display = if window_tokens < 1000 {
+        window_tokens.to_string()
+    } else {
+        format!("{}k", window_tokens / 1000)
+    };
+    format!("{}/{}", used_display, total_display)
 }
 
 /// Replace a leading home-directory prefix with `~` for compact display
@@ -2309,10 +2327,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ));
             } else {
                 // Normal: dim display.
-                let used_k = app.context_used_tokens / 1000;
-                let total_k = app.context_window_size / 1000;
                 parts.push(Span::styled(
-                    format!("{}k/{}k", used_k, total_k),
+                    format_context_counter(app.context_used_tokens, app.context_window_size),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -3077,7 +3093,10 @@ pub fn render_teammate_header(
 #[cfg(test)]
 mod tool_block_tests {
     use super::*;
-    use crate::app::{ToolStatus, ToolUseBlock};
+    use crate::app::{App, ToolStatus, ToolUseBlock};
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use claurst_core::types::Message;
 
     fn block(name: &str, status: ToolStatus, input: &str, preview: Option<&str>) -> ToolUseBlock {
         ToolUseBlock {
@@ -3184,5 +3203,53 @@ mod tool_block_tests {
         assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
         // The raw result-preview string must NOT leak into the checklist view.
         assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
+    }
+
+    #[test]
+    fn context_counter_shows_exact_tokens_below_one_thousand() {
+        assert_eq!(format_context_counter(0, 262_000), "0/262k");
+        assert_eq!(format_context_counter(742, 262_000), "742/262k");
+        assert_eq!(format_context_counter(1_742, 262_000), "1k/262k");
+    }
+
+    #[test]
+    fn turn_renders_tool_blocks_before_final_assistant_text() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.messages.push(Message::user("please inspect the repo"));
+        app.messages.push(Message::assistant("final response after tools"));
+        app.tool_use_blocks.push(ToolUseBlock {
+            id: "tool-1".to_string(),
+            name: "Read".to_string(),
+            turn_index: Some(0),
+            status: ToolStatus::Done,
+            output_preview: Some("file contents".to_string()),
+            input_json: serde_json::json!({ "file_path": "README.md" }).to_string(),
+        });
+
+        let turns = build_transcript_turns(&app);
+        let mut items = Vec::new();
+        append_turn_items(
+            &mut items,
+            &turns[0],
+            100,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            0,
+            Color::White,
+        );
+        let rendered = items
+            .iter()
+            .map(|item| item.search_text.as_str())
+            .collect::<Vec<_>>();
+        let tool_pos = rendered
+            .iter()
+            .position(|line| line.contains("README.md"))
+            .expect("tool block should render");
+        let final_pos = rendered
+            .iter()
+            .position(|line| line.contains("final response after tools"))
+            .expect("assistant text should render");
+
+        assert!(tool_pos < final_pos, "rendered order was {rendered:?}");
     }
 }
